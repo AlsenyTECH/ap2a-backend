@@ -1,0 +1,36 @@
+# Blueprint Render - "New +" → "Blueprint" → sélectionner ce dépôt.
+# Render lit ce fichier et propose de créer le service ci-dessous ;
+# les variables marquées `sync: false` sont demandées dans l'écran de
+# configuration, jamais stockées ici.
+#
+# La base de données n'est volontairement PAS déclarée ici : on utilise
+# un PostgreSQL externe (Neon, gratuit et sans expiration) plutôt que
+# le PostgreSQL gratuit de Render qui expire après 90 jours - coller
+# son URL de connexion dans DATABASE_URL ci-dessous une fois créé.
+
+services:
+  - type: web
+    name: ap2a-backend
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt && python manage.py collectstatic --no-input && python manage.py migrate"
+    startCommand: "gunicorn core.wsgi:application"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.6"
+      - key: DJANGO_DEBUG
+        value: "False"
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DJANGO_ALLOWED_HOSTS
+        value: ".onrender.com"
+      - key: DATABASE_URL
+        sync: false
+      - key: HMAC_CLE_V1
+        sync: false
+      - key: HMAC_VERSION_ACTIVE
+        value: "1"
+      - key: EMAIL_HOST_USER
+        sync: false
+      - key: EMAIL_HOST_PASSWORD
+        sync: false

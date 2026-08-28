@@ -9,8 +9,12 @@ En mode non-interactif (--no-input), utilise les valeurs par défaut
 ou les arguments passés en ligne de commande.
 """
 
+import uuid as uuid_lib
+
+from django.conf import settings
 from django.core.management.base import BaseCommand
-from adhesion.models import Compte, PermissionAdmin
+from django.utils import timezone
+from adhesion.models import Carte, Compte, Membre, PermissionAdmin
 
 
 class Command(BaseCommand):
@@ -21,6 +25,12 @@ class Command(BaseCommand):
         parser.add_argument("--nom", type=str, help="Nom de famille")
         parser.add_argument("--prenom", type=str, help="Prénom")
         parser.add_argument("--mot-de-passe", type=str, help="Mot de passe (sera hashé)")
+        parser.add_argument(
+            "--fonction",
+            type=str,
+            default="PRESIDENT",
+            help="Fonction AP2A du super admin (voir Membre.FONCTION_CHOICES, défaut : PRESIDENT)",
+        )
         parser.add_argument(
             "--no-input",
             action="store_true",
@@ -80,6 +90,14 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.ERROR("Les mots de passe ne correspondent pas."))
                 confirmation = getpass.getpass("Confirmer le mot de passe : ")
 
+        fonction = options.get("fonction") or "PRESIDENT"
+        if fonction not in dict(Membre.FONCTION_CHOICES):
+            self.stdout.write(self.style.ERROR(
+                f"Fonction '{fonction}' inconnue. Choix possibles : "
+                f"{', '.join(code for code, _ in Membre.FONCTION_CHOICES)}"
+            ))
+            return
+
         # Vérifier si l'email est déjà pris
         if Compte.objects.filter(email=email).exists():
             compte = Compte.objects.get(email=email)
@@ -103,11 +121,38 @@ class Command(BaseCommand):
             compte.definir_mot_de_passe(mot_de_passe)
             compte.save()
 
+        # Règle décidée ensemble : tout admin est forcément membre - le
+        # super admin fondateur ne doit pas échapper à cette règle,
+        # sinon il n'a ni fiche membre ni carte virtuelle dans l'app
+        # (voir vue_nommer_admin, qui l'impose déjà pour les admins
+        # nommés par la suite).
+        if not hasattr(compte, "membre"):
+            numero_adherent = f"ADH-{Membre.objects.count() + 1:04d}"
+            membre = Membre.objects.create(
+                numero_adherent=numero_adherent,
+                date_adhesion=timezone.now().date(),
+                compte=compte,
+                fonction_association=fonction,
+            )
+            Carte.objects.create(
+                uuid=str(uuid_lib.uuid4()),
+                type_carte="QR",
+                id_version_cle=settings.HMAC_VERSION_ACTIVE,
+                membre=membre,
+            )
+            fiche_membre_msg = f"\n   Fiche membre : {numero_adherent} ({dict(Membre.FONCTION_CHOICES)[fonction]})"
+        else:
+            fiche_membre_msg = "\n   Fiche membre : déjà existante, inchangée"
+
         self.stdout.write(self.style.SUCCESS(
-            f"\n✅ Super admin créé avec succès !"
+            # Pas d'emoji : la console Windows (cp1252) ne sait pas
+            # toujours l'encoder et fait planter la commande après
+            # coup, alors que les écritures en base ont déjà réussi.
+            f"\nSuper admin créé avec succès !"
             f"\n   Email    : {compte.email}"
             f"\n   Nom      : {compte.prenom} {compte.nom}"
             f"\n   ID       : {compte.id_compte}"
+            f"{fiche_membre_msg}"
             f"\n"
             f"\n   Ce compte a TOUS les droits et ne peut pas être destitué."
             f"\n   Il peut désigner d'autres admins et leur attribuer des permissions."

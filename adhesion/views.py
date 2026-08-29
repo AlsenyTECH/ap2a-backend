@@ -37,6 +37,7 @@ from .utils import (
     generer_signature, verifier_signature, construire_contenu_carte, reconstruire_contenu_carte,
     construire_contenu_rotatif, verifier_signature_temporelle,
     synchroniser_statuts_cohortes, erreur_si_cohorte_verrouillee, TRANSITIONS_COHORTE_AUTORISEES,
+    envoyer_email_arriere_plan,
 )
 from .rapports import excel_depuis_tableau, pdf_depuis_tableau
 
@@ -3333,29 +3334,26 @@ def vue_creer_membre_admin(request):
         membre=membre,
     )
 
-    # En mode EMAIL, tenter d'envoyer un email
+    # En mode EMAIL, envoyer l'email en arrière-plan : un envoi SMTP
+    # synchrone (plusieurs secondes, parfois plus depuis un serveur
+    # cloud) ferait dépasser le timeout du proxy d'hébergement et
+    # ferait échouer la création du membre alors qu'elle a réussi.
     email_envoye = False
     if mode == "EMAIL" and email and not email.endswith("@membre.ap2a.local"):
-        try:
-            from django.core.mail import send_mail
-            send_mail(
-                subject="Bienvenue sur AP2A - Vos identifiants",
-                message=(
-                    f"Bonjour {compte.prenom},\n\n"
-                    f"Votre compte AP2A a été créé.\n\n"
-                    f"Identifiant : {email}\n"
-                    f"Numéro adhérent : {numero_adherent}\n"
-                    f"Mot de passe temporaire : {mot_de_passe}\n\n"
-                    f"Vous devrez changer ce mot de passe lors de votre première connexion.\n\n"
-                    f"Cordialement,\nL'association AP2A"
-                ),
-                from_email=None,  # Utilise DEFAULT_FROM_EMAIL
-                recipient_list=[email],
-                fail_silently=False,
-            )
-            email_envoye = True
-        except Exception:
-            email_envoye = False
+        envoyer_email_arriere_plan(
+            sujet="Bienvenue sur AP2A - Vos identifiants",
+            message=(
+                f"Bonjour {compte.prenom},\n\n"
+                f"Votre compte AP2A a été créé.\n\n"
+                f"Identifiant : {email}\n"
+                f"Numéro adhérent : {numero_adherent}\n"
+                f"Mot de passe temporaire : {mot_de_passe}\n\n"
+                f"Vous devrez changer ce mot de passe lors de votre première connexion.\n\n"
+                f"Cordialement,\nL'association AP2A"
+            ),
+            destinataires=[email],
+        )
+        email_envoye = True
 
     JournalAudit.objects.create(
         type_action="creation_membre_admin",

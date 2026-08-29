@@ -40,7 +40,10 @@ from .permissions import (
     EstAuthentifie, EstMembre, EstAdmin, EstSuperAdmin,
     PeutControler, APermission,
 )
-from .utils import est_email_reel, synchroniser_statuts_cohortes, erreur_si_cohorte_verrouillee
+from .utils import (
+    est_email_reel, synchroniser_statuts_cohortes, erreur_si_cohorte_verrouillee,
+    envoyer_email_arriere_plan,
+)
 
 
 # =========================================================================
@@ -1913,8 +1916,6 @@ def vue_acter_programme_cohorte(request, id_cohorte):
     POST /api/admin/cohorte/<id_cohorte>/acter-programme/
     Passe la cohorte du statut BROUILLON à PROGRAMMEE, et notifie les membres ciblés.
     """
-    from django.core.mail import send_mail
-
     try:
         cohorte = Cohorte.objects.select_related("formation").get(pk=id_cohorte)
     except Cohorte.DoesNotExist:
@@ -1954,18 +1955,14 @@ def vue_acter_programme_cohorte(request, id_cohorte):
         if est_email_reel(m.compte.email):
             emails_to_send.append(m.compte.email)
 
-    # Envoi d'email groupé
+    # Envoi d'email groupé, en arrière-plan (ne doit jamais retarder la
+    # réponse de "Lancer la formation" - voir envoyer_email_arriere_plan).
     if emails_to_send:
-        try:
-            send_mail(
-                subject=f"[AP2A] {titre_notif}",
-                message=f"Bonjour,\n\n{corps_notif}\n\nRetrouvez tous les détails dans votre espace adhérent AP2A.\n\nCordialement,\nL'équipe AP2A",
-                from_email=None,
-                recipient_list=emails_to_send,
-                fail_silently=True,
-            )
-        except Exception:
-            pass
+        envoyer_email_arriere_plan(
+            sujet=f"[AP2A] {titre_notif}",
+            message=f"Bonjour,\n\n{corps_notif}\n\nRetrouvez tous les détails dans votre espace adhérent AP2A.\n\nCordialement,\nL'équipe AP2A",
+            destinataires=emails_to_send,
+        )
 
     JournalAudit.objects.create(
         type_action="ACTER_PROGRAMME_COHORTE",
@@ -1987,8 +1984,6 @@ def vue_acter_programme_evenement(request, id_evenement):
     POST /api/admin/evenement/<id_evenement>/acter-programme/
     Passe l'événement du statut BROUILLON à PROGRAMME, et notifie les membres concernés.
     """
-    from django.core.mail import send_mail
-
     try:
         evenement = Evenement.objects.get(pk=id_evenement)
     except Evenement.DoesNotExist:
@@ -2021,16 +2016,11 @@ def vue_acter_programme_evenement(request, id_evenement):
             emails_to_send.append(m.compte.email)
 
     if emails_to_send:
-        try:
-            send_mail(
-                subject=f"[AP2A] {titre_notif}",
-                message=f"Bonjour,\n\n{corps_notif}\n\nCordialement,\nL'association AP2A",
-                from_email=None,
-                recipient_list=emails_to_send,
-                fail_silently=True,
-            )
-        except Exception:
-            pass
+        envoyer_email_arriere_plan(
+            sujet=f"[AP2A] {titre_notif}",
+            message=f"Bonjour,\n\n{corps_notif}\n\nCordialement,\nL'association AP2A",
+            destinataires=emails_to_send,
+        )
 
     JournalAudit.objects.create(
         type_action="ACTER_PROGRAMME_EVENEMENT",
@@ -2067,7 +2057,6 @@ def vue_renvoyer_identifiants_membre(request, id_membre):
     Une fois fourni, l'email est enregistré sur le compte du membre.
     """
     from django.contrib.auth.hashers import make_password
-    from django.core.mail import send_mail
     import secrets
 
     try:
@@ -2101,26 +2090,24 @@ def vue_renvoyer_identifiants_membre(request, id_membre):
     compte.doit_changer_mot_de_passe = True
     compte.save(update_fields=["mot_de_passe_hash", "doit_changer_mot_de_passe"])
 
-    email_envoye = False
-    try:
-        send_mail(
-            subject="AP2A - Vos identifiants de connexion",
-            message=(
-                f"Bonjour {compte.prenom} {compte.nom},\n\n"
-                f"Voici vos identifiants pour vous connecter à votre espace adhérent AP2A :\n\n"
-                f"Identifiant / Email : {compte.email}\n"
-                f"Numéro adhérent : {membre.numero_adherent}\n"
-                f"Mot de passe temporaire : {nouveau_mdp}\n\n"
-                f"Lors de votre première connexion, vous serez invité à choisir votre propre mot de passe personnel.\n\n"
-                f"Cordialement,\nL'Association AP2A"
-            ),
-            from_email=None,
-            recipient_list=[compte.email],
-            fail_silently=False,
-        )
-        email_envoye = True
-    except Exception:
-        email_envoye = False
+    # Envoi en arrière-plan : un envoi SMTP synchrone (plusieurs
+    # secondes, parfois plus depuis un serveur cloud) ferait dépasser
+    # le timeout du proxy d'hébergement et ferait échouer toute
+    # l'action alors que le mot de passe a déjà été régénéré.
+    envoyer_email_arriere_plan(
+        sujet="AP2A - Vos identifiants de connexion",
+        message=(
+            f"Bonjour {compte.prenom} {compte.nom},\n\n"
+            f"Voici vos identifiants pour vous connecter à votre espace adhérent AP2A :\n\n"
+            f"Identifiant / Email : {compte.email}\n"
+            f"Numéro adhérent : {membre.numero_adherent}\n"
+            f"Mot de passe temporaire : {nouveau_mdp}\n\n"
+            f"Lors de votre première connexion, vous serez invité à choisir votre propre mot de passe personnel.\n\n"
+            f"Cordialement,\nL'Association AP2A"
+        ),
+        destinataires=[compte.email],
+    )
+    email_envoye = True
 
     JournalAudit.objects.create(
         type_action="RENVOI_IDENTIFIANTS",

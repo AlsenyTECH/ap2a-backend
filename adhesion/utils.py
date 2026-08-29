@@ -15,6 +15,7 @@ Rappel du principe (voir discussion) :
 import hmac
 import hashlib
 import time
+import threading
 
 from django.conf import settings
 
@@ -223,6 +224,36 @@ def est_email_reel(email: str | None) -> bool:
     d'y envoyer quoi que ce soit.
     """
     return bool(email) and not email.endswith(SUFFIXE_EMAIL_PLACEHOLDER)
+
+
+def envoyer_email_arriere_plan(sujet: str, message: str, destinataires: list[str]) -> None:
+    """
+    Envoie un email dans un thread séparé, SANS bloquer la requête HTTP
+    en cours. Un envoi SMTP synchrone prend plusieurs secondes (Gmail
+    depuis un serveur cloud peut être encore plus lent, voire hors
+    délai) - assez pour dépasser le timeout du proxy d'hébergement
+    (Render) et faire échouer toute l'action (créer un membre, renvoyer
+    des identifiants...) alors qu'elle a en réalité réussi côté serveur.
+
+    Contrepartie assumée : on ne peut plus garantir de façon synchrone
+    que l'email a été livré au moment où la réponse HTTP part - c'est
+    le compromis standard de ce type d'action (comme "email de
+    réinitialisation envoyé" sur la plupart des sites).
+    """
+    def _envoyer():
+        from django.core.mail import send_mail
+        try:
+            send_mail(
+                subject=sujet,
+                message=message,
+                from_email=None,
+                recipient_list=destinataires,
+                fail_silently=True,
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_envoyer, daemon=True).start()
 
 
 # =====================================================================

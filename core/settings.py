@@ -204,6 +204,23 @@ DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", os.getenv("EMAIL_HOST_USER"
 # aucune limite par défaut.
 EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT", "15"))
 
+# Sans ceci, les erreurs des envois d'email en arrière-plan (voir
+# envoyer_email_arriere_plan) ne sont pas garanties de remonter dans
+# les logs du serveur - indispensable pour diagnostiquer un échec de
+# livraison en production, où on ne peut pas lire l'exception dans la
+# réponse HTTP (l'envoi est déjà terminé quand la réponse part).
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {
+        "console": {"class": "logging.StreamHandler"},
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": "INFO",
+    },
+}
+
 if not EMAIL_HOST_USER:
     EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 else:

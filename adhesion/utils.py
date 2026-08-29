@@ -241,17 +241,20 @@ def envoyer_email_arriere_plan(sujet: str, message: str, destinataires: list[str
     réinitialisation envoyé" sur la plupart des sites).
     """
     def _envoyer():
+        import logging
         from django.core.mail import send_mail
+        logger = logging.getLogger(__name__)
         try:
             send_mail(
                 subject=sujet,
                 message=message,
                 from_email=None,
                 recipient_list=destinataires,
-                fail_silently=True,
+                fail_silently=False,
             )
+            logger.info("Email envoyé avec succès à %s : %s", destinataires, sujet)
         except Exception:
-            pass
+            logger.exception("Échec de l'envoi d'email à %s : %s", destinataires, sujet)
 
     threading.Thread(target=_envoyer, daemon=True).start()
 

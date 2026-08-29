@@ -3351,7 +3351,7 @@ def vue_creer_membre_admin(request):
                 ),
                 from_email=None,  # Utilise DEFAULT_FROM_EMAIL
                 recipient_list=[email],
-                fail_silently=True,
+                fail_silently=False,
             )
             email_envoye = True
         except Exception:

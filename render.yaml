@@ -13,7 +13,9 @@ services:
     name: ap2a-backend
     runtime: python
     plan: free
-    buildCommand: "pip install -r requirements.txt && python manage.py collectstatic --no-input && python manage.py migrate"
+    # amorcer_super_admin ne fait rien tant que AP2A_ADMIN_EMAIL /
+    # AP2A_ADMIN_MOT_DE_PASSE ne sont pas définies (récupération d'accès).
+    buildCommand: "pip install -r requirements.txt && python manage.py collectstatic --no-input && python manage.py migrate && python manage.py amorcer_super_admin"
     startCommand: "gunicorn core.wsgi:application"
     envVars:
       - key: PYTHON_VERSION
@@ -33,4 +35,8 @@ services:
       - key: EMAIL_HOST_USER
         sync: false
       - key: EMAIL_HOST_PASSWORD
+        sync: false
+      # Origine(s) du portail web, ex: https://ap2a-portail.vercel.app
+      # (obligatoire : sans elle, aucun navigateur ne peut appeler l'API).
+      - key: DJANGO_CORS_ALLOWED_ORIGINS
         sync: false

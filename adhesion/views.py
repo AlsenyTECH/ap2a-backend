@@ -6,15 +6,23 @@ email/mot_de_passe en un jeton de session, utilisé ensuite pour
 toutes les requêtes authentifiées (voir authentication.py).
 """
 
+import ipaddress
+import logging
 import uuid as uuid_lib
 import unicodedata
 import re
 import secrets
 import openpyxl
 
+from datetime import timedelta
+
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.db import IntegrityError
+from django.contrib.auth.hashers import check_password, make_password
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
+from django.urls import Resolver404, resolve
 from django.db.models import Count, Q, Min, Max
 from django.db.models.deletion import ProtectedError
 from django.conf import settings
@@ -28,18 +36,92 @@ from rest_framework import status
 
 from .models import (
     Compte, Jeton, Carte, Membre, Evenement, Seance, Participe,
-    Section, Controleur, JournalAudit,
+    Section, Controleur, JournalAudit, TentativeConnexion,
     Formation, Cohorte, Participant, InscriptionCohorte, SeanceCohorte, PresenceCohorte,
     PermissionAdmin, Notification, ConfirmationEvenement,
 )
-from .permissions import EstMembre, EstAdmin, EstAdminPrincipal, EstAuthentifie, PeutControler, EstControleur
+from .permissions import (
+    EstMembre, EstAdmin, EstAdminPrincipal, EstAuthentifie, PeutControler, EstControleur,
+    APermission, APermissionUneParmi, compte_a_permission,
+)
 from .utils import (
-    generer_signature, verifier_signature, construire_contenu_carte, reconstruire_contenu_carte,
+    generer_signature, verifier_signature, construire_contenu_carte, DOMAINE_BADGE,
     construire_contenu_rotatif, verifier_signature_temporelle,
     synchroniser_statuts_cohortes, erreur_si_cohorte_verrouillee, TRANSITIONS_COHORTE_AUTORISEES,
-    envoyer_email_arriere_plan,
+    envoyer_email_arriere_plan, generer_mot_de_passe_temporaire, erreur_image_televersee,
+)
+from .authentication import TELECHARGEMENTS_PAR_LIEN
+from .tickets import (
+    emettre_ticket_scan, lire_ticket_scan, consommer_ticket_scan, emettre_lien_telechargement,
+    TicketInvalide, TicketDejaUtilise, TYPE_MEMBRE, TYPE_PARTICIPANT, MODE_SCAN, MODE_MANUEL,
 )
 from .rapports import excel_depuis_tableau, pdf_depuis_tableau
+
+logger = logging.getLogger(__name__)
+
+
+# Hash PBKDF2 d'un mot de passe aléatoire jamais utilisé : vérifié quand
+# l'identifiant ne correspond à aucun compte, pour que la réponse prenne
+# le même temps que pour un compte existant (sinon la durée de réponse
+# révèle quels emails/numéros d'adhérent existent).
+_HASH_FACTICE = None
+
+
+def _hash_factice():
+    global _HASH_FACTICE
+    if _HASH_FACTICE is None:
+        _HASH_FACTICE = make_password(secrets.token_urlsafe(32))
+    return _HASH_FACTICE
+
+
+def adresse_ip_client(request):
+    """
+    IP du client. Derrière le proxy de l'hébergeur, REMOTE_ADDR est celle
+    du proxy : on prend alors la première adresse de X-Forwarded-For.
+    Elle est falsifiable par le client - la limite par IP n'est donc
+    qu'une barrière secondaire, la vraie protection est la limite par
+    identifiant (non contournable).
+    """
+    transmise = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    ip = transmise.split(",")[0].strip() if transmise else request.META.get("REMOTE_ADDR")
+    try:
+        return str(ipaddress.ip_address(ip)) if ip else None
+    except ValueError:
+        return None
+
+
+def _connexion_bloquee(identifiant, ip):
+    """
+    Nombre de secondes avant de pouvoir réessayer, ou 0. Fenêtre
+    glissante : on compte les échecs des CONNEXION_FENETRE_MINUTES
+    dernières minutes, par identifiant saisi et par IP.
+    """
+    depuis = timezone.now() - timedelta(minutes=settings.CONNEXION_FENETRE_MINUTES)
+    recentes = TentativeConnexion.objects.filter(date_tentative__gte=depuis)
+
+    echecs_identifiant = recentes.filter(identifiant=identifiant)
+    candidats = []
+    if echecs_identifiant.count() >= settings.CONNEXION_MAX_ECHECS_IDENTIFIANT:
+        candidats.append(echecs_identifiant)
+    if ip:
+        echecs_ip = recentes.filter(adresse_ip=ip)
+        if echecs_ip.count() >= settings.CONNEXION_MAX_ECHECS_IP:
+            candidats.append(echecs_ip)
+    if not candidats:
+        return 0
+
+    # Débloqué quand le plus ancien échec pris en compte sort de la fenêtre.
+    attente = 0
+    for echecs in candidats:
+        plus_ancien = echecs.order_by("date_tentative").values_list("date_tentative", flat=True).first()
+        fin_blocage = plus_ancien + timedelta(minutes=settings.CONNEXION_FENETRE_MINUTES)
+        attente = max(attente, int((fin_blocage - timezone.now()).total_seconds()) + 1)
+    return attente
+
+
+def _enregistrer_echec_connexion(identifiant, ip):
+    TentativeConnexion.objects.create(identifiant=identifiant, adresse_ip=ip)
+    TentativeConnexion.objects.filter(date_tentative__lt=timezone.now() - timedelta(days=1)).delete()
 
 
 @api_view(["POST"])
@@ -48,35 +130,59 @@ def vue_connexion(request):
     """
     POST /api/login/
     Corps attendu (JSON) : {"email": "...", "mot_de_passe": "..."}
+
+    Protégée contre la recherche exhaustive : au-delà de
+    CONNEXION_MAX_ECHECS_IDENTIFIANT échecs en CONNEXION_FENETRE_MINUTES
+    pour un même identifiant (ou CONNEXION_MAX_ECHECS_IP pour une même
+    IP), toute tentative est refusée (429) SANS vérifier le mot de passe,
+    même correct. Le compteur porte sur l'identifiant saisi, qu'il
+    existe ou non : le blocage ne révèle pas l'existence d'un compte.
     """
-    email = request.data.get("email", "").strip()
+    email = str(request.data.get("email", "")).strip()
     mot_de_passe = request.data.get("mot_de_passe")
 
-    if not email or not mot_de_passe:
+    if not email or not mot_de_passe or not isinstance(mot_de_passe, str):
         return Response(
             {"erreur": "Identifiant et mot_de_passe sont requis"},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    # Lookup : essayer d'abord par email, puis par numéro adhérent
-    try:
-        compte = Compte.objects.get(email=email)
-    except Compte.DoesNotExist:
-        # Tenter de trouver par numéro adhérent
-        try:
-            membre = Membre.objects.select_related("compte").get(numero_adherent=email)
-            compte = membre.compte
-        except Membre.DoesNotExist:
-            return Response(
-                {"erreur": "Identifiant ou mot de passe incorrect"},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
+    identifiant = email.lower()[:150]
+    ip = adresse_ip_client(request)
 
-    if not compte.verifier_mot_de_passe(mot_de_passe):
+    attente = _connexion_bloquee(identifiant, ip)
+    if attente:
+        minutes = max(1, -(-attente // 60))
+        reponse = Response(
+            {
+                "erreur": f"Trop de tentatives de connexion. Réessayez dans {minutes} minute(s).",
+                "code": "TROP_DE_TENTATIVES",
+            },
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+        reponse["Retry-After"] = str(attente)
+        return reponse
+
+    # Lookup : essayer d'abord par email, puis par numéro adhérent
+    compte = Compte.objects.filter(email=email).first()
+    if compte is None:
+        membre = Membre.objects.select_related("compte").filter(numero_adherent=email).first()
+        compte = membre.compte if membre else None
+
+    if compte is None:
+        check_password(mot_de_passe, _hash_factice())
+        mot_de_passe_ok = False
+    else:
+        mot_de_passe_ok = compte.verifier_mot_de_passe(mot_de_passe)
+
+    if not mot_de_passe_ok:
+        _enregistrer_echec_connexion(identifiant, ip)
         return Response(
             {"erreur": "Identifiant ou mot de passe incorrect"},
             status=status.HTTP_401_UNAUTHORIZED,
         )
+
+    TentativeConnexion.objects.filter(identifiant=identifiant).delete()
 
     if compte.statut_compte != "ACTIF":
         return Response(
@@ -84,17 +190,12 @@ def vue_connexion(request):
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    # update_or_create : si un jeton existe déjà pour ce compte, on le
-    # remplace (cohérent avec le choix OneToOneField sur Jeton : une
-    # seule session active à la fois, toute reconnexion invalide
-    # l'ancien jeton).
-    jeton, _ = Jeton.objects.update_or_create(
-        compte=compte,
-        defaults={"cle": Jeton.generer_cle()},
-    )
+    # Un seul jeton par compte (OneToOneField) : toute reconnexion
+    # invalide l'ancien jeton. Seule son empreinte est stockée.
+    cle_jeton = Jeton.ouvrir_session(compte)
 
     return Response({
-        "jeton": jeton.cle,
+        "jeton": cle_jeton,
         "nom": compte.nom,
         "prenom": compte.prenom,
         "est_admin": compte.est_admin,
@@ -115,24 +216,74 @@ def vue_connexion(request):
     })
 
 
+@api_view(["POST"])
+@permission_classes([EstAuthentifie])
+def vue_deconnexion(request):
+    """
+    POST /api/logout/
+    Révoque le jeton de la session courante côté serveur : il devient
+    inutilisable immédiatement, même s'il a été copié ailleurs.
+    """
+    Jeton.objects.filter(compte=request.user).delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(["POST"])
+@permission_classes([EstAuthentifie])
+def vue_lien_telechargement(request):
+    """
+    POST /api/telechargement/lien/
+    Corps : {"chemin": "/admin/rapports/export/"} (relatif à la racine de l'API)
+
+    Retourne un lien signé à ajouter en paramètre ?telechargement=...
+    pour ouvrir directement un fichier (sans en-tête Authorization),
+    valable LIEN_TELECHARGEMENT_DUREE_SECONDES, pour ce compte et cette
+    route uniquement. Les permissions de la route restent vérifiées au
+    téléchargement : le lien authentifie, il n'autorise rien de plus.
+    """
+    chemin = str(request.data.get("chemin", ""))
+    racine_api = request.path[: -len("telechargement/lien/")]
+    chemin_complet = racine_api + chemin.split("?")[0].lstrip("/")
+
+    try:
+        correspondance = resolve(chemin_complet)
+    except Resolver404:
+        correspondance = None
+    if correspondance is None or correspondance.url_name not in TELECHARGEMENTS_PAR_LIEN:
+        return Response(
+            {"erreur": "Ce chemin n'est pas un téléchargement autorisé"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response({
+        "telechargement": emettre_lien_telechargement(request.user, chemin_complet),
+        "expire_dans": settings.LIEN_TELECHARGEMENT_DUREE_SECONDES,
+    })
+
+
 @api_view(["GET"])
 @permission_classes([PeutControler])
 def vue_verifier(request, uuid_carte, version, signature):
     """
     GET /api/verifier/<uuid_carte>/<version>/<signature>/
-    Vérification du QR STATIQUE (carte physique imprimée, ou carte
-    virtuelle avant l'ajout du QR rotatif). Signature valable
-    indéfiniment tant que la clé n'est pas retirée du trousseau.
+    Vérification du contenu STATIQUE d'une carte physique (NFC).
+    Signature valable indéfiniment tant que la clé n'est pas retirée
+    du trousseau.
+
+    Les cartes virtuelles (type QR) sont REFUSÉES ici : elles ne se
+    présentent qu'avec le QR rotatif. Sinon une simple capture d'écran
+    d'un ancien contenu statique resterait valable pour toujours et
+    annulerait tout l'intérêt de la rotation.
     """
     uuid_str = str(uuid_carte)
 
     if not verifier_signature(uuid_str, signature, version):
         return Response(
             {"valide": False, "erreur": "Signature invalide"},
-            status=status.HTTP_401_UNAUTHORIZED,
+            status=status.HTTP_403_FORBIDDEN,
         )
 
-    return _resultat_verification_carte(uuid_carte)
+    return _resultat_verification_carte(request, uuid_carte, type_carte="NFC")
 
 
 @api_view(["GET"])
@@ -151,21 +302,22 @@ def vue_verifier_rotatif(request, uuid_carte, version, fenetre, signature):
     if not verifier_signature_temporelle(uuid_str, fenetre, version, signature):
         return Response(
             {"valide": False, "erreur": "QR expiré ou signature invalide - redemandez à la personne de rafraîchir sa carte"},
-            status=status.HTTP_401_UNAUTHORIZED,
+            status=status.HTTP_403_FORBIDDEN,
         )
 
-    return _resultat_verification_carte(uuid_carte)
+    return _resultat_verification_carte(request, uuid_carte, type_carte="QR")
 
 
-def _resultat_verification_carte(uuid_carte):
+def _resultat_verification_carte(request, uuid_carte, type_carte):
     """
     Logique commune aux deux endpoints de vérification (statique et
-    rotatif) : une fois la signature authentifiée (peu importe
-    laquelle des deux méthodes), la suite est identique - chercher la
-    carte, vérifier les statuts, renvoyer l'identité.
+    rotatif) : une fois la signature authentifiée, la suite est
+    identique - chercher la carte, vérifier les statuts, renvoyer
+    l'identité ET un ticket de scan à usage unique, seul moyen de
+    confirmer ensuite l'entrée (voir tickets.py).
     """
     try:
-        carte = Carte.objects.select_related("membre__compte").get(uuid=uuid_carte)
+        carte = Carte.objects.select_related("membre__compte").get(uuid=uuid_carte, type_carte=type_carte)
     except Carte.DoesNotExist:
         return Response(
             {"valide": False, "erreur": "Carte introuvable"},
@@ -192,6 +344,7 @@ def _resultat_verification_carte(uuid_carte):
         "prenom": membre.compte.prenom,
         "numero_adherent": membre.numero_adherent,
         "photo": membre.photo.url if membre.photo else None,
+        "ticket_scan": emettre_ticket_scan(TYPE_MEMBRE, membre.id_membre, request.user, MODE_SCAN),
     })
 
 
@@ -200,20 +353,23 @@ def _resultat_verification_carte(uuid_carte):
 def vue_confirmer_entree(request):
     """
     POST /api/confirmer-entree/
-    Corps attendu : {"id_membre": ..., "id_seance": ..., "methode_scan": "QR"|"NFC"|"MANUEL"}
+    Corps attendu : {"ticket_scan": ..., "id_seance": ..., "methode_scan": "QR"|"NFC"|"MANUEL"}
 
-    CHANGÉ : id_seance remplace id_evenement - une présence est
-    désormais rattachée à un jour précis (une séance), pas à
-    l'événement dans son ensemble, pour permettre le suivi jour par
-    jour d'une formation multi-jours.
+    Une présence est rattachée à un jour précis (une séance), pas à
+    l'événement dans son ensemble.
+
+    Le membre est désigné par le TICKET DE SCAN renvoyé par la
+    vérification (vue_verifier / vue_verifier_rotatif pour QR/NFC,
+    vue_verifier_manuel pour MANUEL), et non par un id_membre libre :
+    on ne peut enregistrer que la présence d'une personne dont la carte
+    vient réellement d'être vérifiée, une seule fois (voir tickets.py).
     """
-    id_membre = request.data.get("id_membre")
     id_seance = request.data.get("id_seance")
     methode_scan = request.data.get("methode_scan")
 
-    if not all([id_membre, id_seance, methode_scan]):
+    if not all([id_seance, methode_scan]):
         return Response(
-            {"erreur": "id_membre, id_seance et methode_scan sont requis"},
+            {"erreur": "ticket_scan, id_seance et methode_scan sont requis"},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -222,6 +378,23 @@ def vue_confirmer_entree(request):
             {"erreur": "methode_scan doit être QR, NFC ou MANUEL"},
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+    ticket = request.data.get("ticket_scan")
+    contenu_ticket = None
+    if ticket or settings.TICKET_SCAN_OBLIGATOIRE:
+        mode = MODE_MANUEL if methode_scan == "MANUEL" else MODE_SCAN
+        try:
+            contenu_ticket = lire_ticket_scan(ticket, TYPE_MEMBRE, request.user, mode)
+        except TicketInvalide as e:
+            return Response({"erreur": str(e), "code": "TICKET_SCAN_INVALIDE"}, status=status.HTTP_403_FORBIDDEN)
+        id_membre = contenu_ticket["id"]
+    else:
+        # Mode de transition (TICKET_SCAN_OBLIGATOIRE=False) pour un
+        # client pas encore mis à jour : ancien comportement, journalisé.
+        id_membre = request.data.get("id_membre")
+        if not id_membre:
+            return Response({"erreur": "id_membre est requis"}, status=status.HTTP_400_BAD_REQUEST)
+        logger.warning("confirmer-entree sans ticket de scan (compte %s)", request.user.id_compte)
 
     try:
         membre = Membre.objects.select_related("compte").get(id_membre=id_membre)
@@ -261,14 +434,22 @@ def vue_confirmer_entree(request):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-    try:
-        participation = Participe.objects.create(
+    def enregistrer():
+        return Participe.objects.create(
             membre=membre,
             seance=seance,
             heure_arrivee=timezone.now(),
             methode_scan=methode_scan,
             controleur_scan=controleur,
         )
+
+    try:
+        if contenu_ticket is not None:
+            participation = consommer_ticket_scan(contenu_ticket, enregistrer)
+        else:
+            participation = enregistrer()
+    except TicketDejaUtilise as e:
+        return Response({"erreur": str(e), "code": "TICKET_SCAN_INVALIDE"}, status=status.HTTP_409_CONFLICT)
     except IntegrityError:
         # Violation de unique_together (membre, seance) : ce membre
         # est déjà enregistré présent à CETTE séance précise - il
@@ -366,11 +547,12 @@ def vue_verifier_manuel(request, numero_adherent):
         "prenom": membre.compte.prenom,
         "statut_adhesion": membre.statut_adhesion,
         "photo": membre.photo.url if membre.photo else None,
+        "ticket_scan": emettre_ticket_scan(TYPE_MEMBRE, membre.id_membre, request.user, MODE_MANUEL),
     })
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_MEMBRES")])
 def vue_bloquer_carte(request, id_carte):
     """
     POST /api/admin/carte/<id_carte>/bloquer/
@@ -390,6 +572,7 @@ def vue_bloquer_carte(request, id_carte):
     compte_membre = carte.membre.compte
     compte_membre.statut_compte = "SUSPENDU"
     compte_membre.save()
+    Jeton.objects.filter(compte=compte_membre).delete()
 
     JournalAudit.objects.create(
         type_action="blocage_carte",
@@ -400,7 +583,7 @@ def vue_bloquer_carte(request, id_carte):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_MEMBRES")])
 def vue_activer_carte(request, id_carte):
     """
     POST /api/admin/carte/<id_carte>/activer/
@@ -463,7 +646,7 @@ def vue_nommer_admin(request):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_CONTROLEURS")])
 def vue_creer_controleur(request):
     """
     POST /api/admin/creer-controleur/
@@ -533,7 +716,7 @@ def vue_creer_controleur(request):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_EVENEMENTS")])
 def vue_creer_evenement(request):
     """
     POST /api/admin/evenement/
@@ -604,7 +787,7 @@ def vue_creer_evenement(request):
 
 
 @api_view(["PATCH", "DELETE"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_EVENEMENTS")])
 def vue_modifier_ou_supprimer_evenement(request, id_evenement):
     """
     PATCH /api/admin/evenement/<id>/modifier/
@@ -683,7 +866,7 @@ def vue_modifier_ou_supprimer_evenement(request, id_evenement):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_EVENEMENTS")])
 def vue_annuler_evenement(request, id_evenement):
     """
     POST /api/admin/evenement/<id>/annuler/
@@ -756,7 +939,7 @@ def vue_liste_seances(request, id_evenement):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("VOIR_RAPPORTS")])
 def vue_statistiques(request):
     """GET /api/admin/statistiques/"""
     par_section = (
@@ -788,7 +971,7 @@ def vue_statistiques(request):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("VOIR_RAPPORTS")])
 def vue_journal_audit(request):
     """
     GET /api/admin/journal/?type_action=...&date_debut=YYYY-MM-DD
@@ -848,7 +1031,7 @@ def vue_journal_audit(request):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermissionUneParmi("GERER_CONTROLEURS", "GERER_MEMBRES")])
 def vue_recherche_comptes(request):
     """
     GET /api/admin/recherche-comptes/?q=...
@@ -880,7 +1063,7 @@ def vue_recherche_comptes(request):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_CONTROLEURS")])
 def vue_liste_controleurs(request):
     """GET /api/admin/controleurs/"""
     controleurs = Controleur.objects.select_related("compte", "evenement_assigne").order_by(
@@ -906,7 +1089,7 @@ def vue_liste_controleurs(request):
 
 
 @api_view(["PATCH"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_CONTROLEURS")])
 def vue_modifier_controleur(request, id_controleur):
     """
     PATCH /api/admin/controleur/<id>/
@@ -946,7 +1129,7 @@ def vue_modifier_controleur(request, id_controleur):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_CONTROLEURS")])
 def vue_assigner_controleur(request, id_controleur):
     """
     POST /api/admin/controleur/<id>/assigner/
@@ -986,7 +1169,7 @@ def vue_assigner_controleur(request, id_controleur):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_CONTROLEURS")])
 def vue_reinitialiser_mot_de_passe_controleur(request, id_controleur):
     """
     POST /api/admin/controleur/<id>/reinitialiser-mot-de-passe/
@@ -999,10 +1182,12 @@ def vue_reinitialiser_mot_de_passe_controleur(request, id_controleur):
     except Controleur.DoesNotExist:
         return Response({"erreur": "Contrôleur introuvable"}, status=status.HTTP_404_NOT_FOUND)
 
-    mot_de_passe_temp = f"AP2A-{secrets.token_hex(4)}"
+    mot_de_passe_temp = generer_mot_de_passe_temporaire()
     controleur.compte.definir_mot_de_passe(mot_de_passe_temp)
     controleur.compte.doit_changer_mot_de_passe = True
     controleur.compte.save()
+    # L'ancienne session ne doit pas survivre à la réinitialisation.
+    Jeton.objects.filter(compte=controleur.compte).delete()
 
     JournalAudit.objects.create(
         type_action="reinitialisation_mot_de_passe_controleur",
@@ -1013,7 +1198,7 @@ def vue_reinitialiser_mot_de_passe_controleur(request, id_controleur):
 
 
 @api_view(["DELETE"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_CONTROLEURS")])
 def vue_supprimer_controleur(request, id_controleur):
     """
     DELETE /api/admin/controleur/<id>/
@@ -1079,16 +1264,19 @@ def vue_changer_mot_de_passe(request):
         )
 
     if not compte.verifier_mot_de_passe(ancien):
+        # 400 et non 401 : la session reste valide, seul l'ancien mot
+        # de passe saisi est faux (un 401 déconnecterait le client).
         return Response(
             {"erreur": "Ancien mot de passe incorrect"},
-            status=status.HTTP_401_UNAUTHORIZED,
-        )
-
-    if len(nouveau) < 8:
-        return Response(
-            {"erreur": "Le nouveau mot de passe doit faire au moins 8 caractères"},
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+    # Validateurs Django (AUTH_PASSWORD_VALIDATORS) : longueur, mots de
+    # passe courants, entièrement numériques, trop proches de l'identité.
+    try:
+        validate_password(nouveau, user=compte)
+    except ValidationError as e:
+        return Response({"erreur": " ".join(e.messages)}, status=status.HTTP_400_BAD_REQUEST)
 
     compte.definir_mot_de_passe(nouveau)
     compte.doit_changer_mot_de_passe = False
@@ -1152,6 +1340,10 @@ def vue_televerser_photo(request):
     if photo is None:
         return Response({"erreur": "Fichier manquant (champ 'photo')"}, status=status.HTTP_400_BAD_REQUEST)
 
+    erreur = erreur_image_televersee(photo)
+    if erreur:
+        return Response({"erreur": erreur}, status=status.HTTP_400_BAD_REQUEST)
+
     membre = request.user.membre
     membre.photo = photo
     membre.save()
@@ -1203,21 +1395,20 @@ def vue_mon_profil(request):
             id_version_cle=settings.HMAC_VERSION_ACTIVE,
             membre=membre,
         )
-    contenu_carte = reconstruire_contenu_carte(str(carte_qr.uuid), carte_qr.id_version_cle)
-
     carte_nfc = membre.cartes.filter(type_carte="NFC").order_by("-date_emission").first()
 
     return Response({
         "nom": compte.nom,
         "prenom": compte.prenom,
         "numero_adherent": membre.numero_adherent,
-        "section": membre.section.nom_section,
+        "section": membre.section.nom_section if membre.section else None,
         "date_adhesion": membre.date_adhesion,
         "statut_adhesion": membre.statut_adhesion,
         "photo": membre.photo.url if membre.photo else None,
+        # Pas de contenu signé ici : la carte virtuelle ne s'affiche
+        # qu'avec le QR rotatif (GET /api/membre/qr-actuel/).
         "carte_qr": {
             "statut_carte": carte_qr.statut_carte,
-            "contenu_carte": contenu_carte,
         },
         "carte_physique": (
             {"type_carte": "NFC", "statut_carte": carte_nfc.statut_carte}
@@ -1297,7 +1488,7 @@ def vue_liste_sections(request):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermissionUneParmi("GERER_MEMBRES", "GERER_EVENEMENTS", "GERER_FORMATIONS", "GERER_ACTIONS_SOCIALES")])
 def vue_liste_membres(request):
     """
     GET /api/admin/membres/?q=&statut_carte=&id_section=&fonction=&tri=
@@ -1409,7 +1600,7 @@ def _serialiser_membre_detail(membre):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_MEMBRES")])
 def vue_detail_membre(request, id_membre):
     """
     GET /api/admin/membre/<id_membre>/
@@ -1427,7 +1618,7 @@ def vue_detail_membre(request, id_membre):
 
 
 @api_view(["PATCH"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_MEMBRES")])
 def vue_modifier_membre(request, id_membre):
     """
     PATCH /api/admin/membre/<id_membre>/modifier/
@@ -1508,7 +1699,7 @@ def vue_modifier_membre(request, id_membre):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_EVENEMENTS")])
 def vue_terminer_evenement(request, id_evenement):
     """
     POST /api/admin/evenement/<id_evenement>/terminer/
@@ -1558,7 +1749,7 @@ def vue_terminer_evenement(request, id_evenement):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_EVENEMENTS")])
 def vue_historique_evenements(request):
     """
     GET /api/admin/evenements/historique/
@@ -1586,7 +1777,7 @@ def vue_historique_evenements(request):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_EVENEMENTS")])
 def vue_detail_evenement(request, id_evenement):
     """
     GET /api/admin/evenement/<id_evenement>/
@@ -1801,7 +1992,7 @@ def _scans_controle_acces(request):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("VOIR_RAPPORTS")])
 def vue_rapport_controle_acces(request):
     """
     GET /api/admin/rapport-controle-acces/?id_controleur=&date_debut=&date_fin=
@@ -1856,7 +2047,7 @@ def _donnees_rapport_journal(request):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("VOIR_RAPPORTS")])
 def vue_exporter_rapport(request):
     """
     GET /api/admin/rapports/export/?type=statistiques|evenement|journal
@@ -1951,7 +2142,7 @@ def vue_liste_formations(request):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_creer_formation(request):
     """
     POST /api/admin/formation/
@@ -1987,7 +2178,7 @@ def vue_creer_formation(request):
 
 
 @api_view(["PATCH", "DELETE"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_modifier_ou_supprimer_formation(request, id_formation):
     """
     PATCH /api/admin/formation/<id>/  - modification partielle (seuls
@@ -2105,7 +2296,7 @@ def _recalculer_dates_cohorte(cohorte):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_creer_cohorte(request):
     """
     POST /api/admin/cohorte/
@@ -2213,7 +2404,7 @@ def vue_creer_cohorte(request):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_changer_statut_cohorte(request, id_cohorte):
     """
     POST /api/admin/cohorte/<id>/statut/ - Corps : {"statut": "..."}
@@ -2244,7 +2435,7 @@ def vue_changer_statut_cohorte(request, id_cohorte):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_terminer_cohorte(request, id_cohorte):
     """
     POST /api/admin/cohorte/<id>/terminer/
@@ -2276,7 +2467,7 @@ def vue_terminer_cohorte(request, id_cohorte):
 
 
 @api_view(["PATCH", "DELETE"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_modifier_ou_supprimer_cohorte(request, id_cohorte):
     """
     PATCH /api/admin/cohorte/<id>/  - modification partielle (lieu,
@@ -2438,7 +2629,7 @@ def vue_mes_cohortes(request):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_liste_participants_cohorte(request, id_cohorte):
     """
     GET /api/admin/cohorte/<id>/participants/
@@ -2486,7 +2677,7 @@ def vue_liste_participants_cohorte(request, id_cohorte):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_basculer_kit_distribue(request, id_inscription):
     """
     POST /api/admin/inscription/<id_inscription>/kit/
@@ -2513,7 +2704,7 @@ def vue_basculer_kit_distribue(request, id_inscription):
 
 
 @api_view(["DELETE"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_retirer_participant_cohorte(request, id_inscription):
     """
     DELETE /api/admin/inscription/<id_inscription>/
@@ -2548,7 +2739,7 @@ def vue_retirer_participant_cohorte(request, id_inscription):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_ajouter_seance_cohorte(request, id_cohorte):
     """
     POST /api/admin/cohorte/<id_cohorte>/seances/
@@ -2591,7 +2782,7 @@ def vue_ajouter_seance_cohorte(request, id_cohorte):
 
 
 @api_view(["PATCH", "DELETE"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_gerer_seance_cohorte(request, id_seance_cohorte):
     """
     PATCH /api/admin/seance-cohorte/<id_seance_cohorte>/ - modifier date, lieu, titre, etc.
@@ -2647,7 +2838,7 @@ def vue_gerer_seance_cohorte(request, id_seance_cohorte):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_ajouter_participant_manuel(request, id_cohorte):
     """
     POST /api/admin/cohorte/<id>/participant/
@@ -2699,14 +2890,14 @@ def vue_ajouter_participant_manuel(request, id_cohorte):
         {
             "id_participant": participant.id_participant,
             "numero_badge": participant.numero_badge,
-            "badge": construire_contenu_carte(str(participant.uuid)),
+            "badge": construire_contenu_carte(str(participant.uuid), DOMAINE_BADGE),
         },
         status=status.HTTP_201_CREATED,
     )
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_detail_participant(request, id_participant):
     """
     GET /api/admin/participant/<id>/
@@ -2735,7 +2926,7 @@ def vue_detail_participant(request, id_participant):
         "telephone": participant.telephone,
         "numero_carte_identite": participant.numero_carte_identite,
         "numero_badge": participant.numero_badge,
-        "badge": construire_contenu_carte(str(participant.uuid)),
+        "badge": construire_contenu_carte(str(participant.uuid), DOMAINE_BADGE),
         "photo": photo_url,
         "a_un_compte": participant.membre_id is not None,
         "formations": [
@@ -2750,7 +2941,7 @@ def vue_detail_participant(request, id_participant):
 
 
 @api_view(["PATCH"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_modifier_participant(request, id_participant):
     """
     PATCH /api/admin/participant/<id>/modifier/
@@ -2869,7 +3060,7 @@ def _trouver_colonne(entetes_normalisees, alias):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 @parser_classes([MultiPartParser, FormParser])
 def vue_importer_participants_excel(request, id_cohorte):
     """
@@ -3049,9 +3240,9 @@ def vue_verifier_participant(request, uuid_participant, version, signature):
     en a un (mise à jour depuis "Profil"), sinon de la photo ajoutée
     directement par un organisateur.
     """
-    if not verifier_signature(str(uuid_participant), signature, version):
+    if not verifier_signature(str(uuid_participant), signature, version, domaine=DOMAINE_BADGE):
         return Response(
-            {"valide": False, "erreur": "Signature invalide"}, status=status.HTTP_401_UNAUTHORIZED
+            {"valide": False, "erreur": "Signature invalide"}, status=status.HTTP_403_FORBIDDEN
         )
 
     try:
@@ -3071,6 +3262,9 @@ def vue_verifier_participant(request, uuid_participant, version, signature):
         "nom": participant.nom,
         "prenom": participant.prenom,
         "photo": photo_url,
+        "ticket_scan": emettre_ticket_scan(
+            TYPE_PARTICIPANT, participant.id_participant, request.user, MODE_SCAN
+        ),
     })
 
 
@@ -3079,19 +3273,47 @@ def vue_verifier_participant(request, uuid_participant, version, signature):
 def vue_confirmer_presence_cohorte(request):
     """
     POST /api/confirmer-presence-cohorte/
-    Corps : {"id_participant", "id_seance_cohorte", "methode_scan"}
+    Corps : {"ticket_scan", "id_seance_cohorte", "methode_scan"}
+
+    QR/NFC : le participant est désigné par le ticket de scan renvoyé
+    par vue_verifier_participant (voir tickets.py).
+    MANUEL : pas de vérification de badge possible, donc réservé aux
+    admins ayant GERER_FORMATIONS, qui désignent le participant par
+    "id_participant" ; chaque saisie manuelle est journalisée.
     """
-    id_participant = request.data.get("id_participant")
     id_seance_cohorte = request.data.get("id_seance_cohorte")
     methode_scan = request.data.get("methode_scan")
 
-    if not all([id_participant, id_seance_cohorte, methode_scan]):
+    if not all([id_seance_cohorte, methode_scan]):
         return Response(
-            {"erreur": "id_participant, id_seance_cohorte et methode_scan sont requis"},
+            {"erreur": "ticket_scan, id_seance_cohorte et methode_scan sont requis"},
             status=status.HTTP_400_BAD_REQUEST,
         )
     if methode_scan not in dict(Participe.METHODE_CHOICES):
         return Response({"erreur": "methode_scan invalide"}, status=status.HTTP_400_BAD_REQUEST)
+
+    contenu_ticket = None
+    ticket = request.data.get("ticket_scan")
+    if methode_scan == "MANUEL":
+        if not compte_a_permission(request.user, "GERER_FORMATIONS"):
+            return Response(
+                {"erreur": "La saisie manuelle de présence est réservée aux gestionnaires des formations"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        id_participant = request.data.get("id_participant")
+        if not id_participant:
+            return Response({"erreur": "id_participant est requis"}, status=status.HTTP_400_BAD_REQUEST)
+    elif ticket or settings.TICKET_SCAN_OBLIGATOIRE:
+        try:
+            contenu_ticket = lire_ticket_scan(ticket, TYPE_PARTICIPANT, request.user, MODE_SCAN)
+        except TicketInvalide as e:
+            return Response({"erreur": str(e), "code": "TICKET_SCAN_INVALIDE"}, status=status.HTTP_403_FORBIDDEN)
+        id_participant = contenu_ticket["id"]
+    else:
+        id_participant = request.data.get("id_participant")
+        if not id_participant:
+            return Response({"erreur": "id_participant est requis"}, status=status.HTTP_400_BAD_REQUEST)
+        logger.warning("confirmer-presence-cohorte sans ticket de scan (compte %s)", request.user.id_compte)
 
     try:
         participant = Participant.objects.get(id_participant=id_participant)
@@ -3116,18 +3338,36 @@ def vue_confirmer_presence_cohorte(request):
         defaults={"date_nomination": timezone.now().date()},
     )
 
-    try:
-        presence = PresenceCohorte.objects.create(
+    def enregistrer():
+        return PresenceCohorte.objects.create(
             participant=participant,
             seance_cohorte=seance_cohorte,
             heure_arrivee=timezone.now(),
             methode_scan=methode_scan,
             controleur_scan=controleur,
         )
+
+    try:
+        if contenu_ticket is not None:
+            presence = consommer_ticket_scan(contenu_ticket, enregistrer)
+        else:
+            presence = enregistrer()
+    except TicketDejaUtilise as e:
+        return Response({"erreur": str(e), "code": "TICKET_SCAN_INVALIDE"}, status=status.HTTP_409_CONFLICT)
     except IntegrityError:
         return Response(
             {"erreur": "Ce participant est déjà enregistré présent à cette séance"},
             status=status.HTTP_409_CONFLICT,
+        )
+
+    if methode_scan == "MANUEL":
+        JournalAudit.objects.create(
+            type_action="presence_manuelle_cohorte",
+            description=(
+                f"Présence manuelle : {participant.prenom} {participant.nom} - "
+                f"{seance_cohorte.cohorte.code_cohorte} séance {seance_cohorte.numero_ordre}"
+            ),
+            compte_auteur=request.user,
         )
 
     return Response(
@@ -3143,7 +3383,7 @@ def vue_confirmer_presence_cohorte(request):
 
 
 @api_view(["GET"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 def vue_detail_cohorte(request, id_cohorte):
     """
     GET /api/admin/cohorte/<id>/
@@ -3212,7 +3452,7 @@ def vue_detail_cohorte(request, id_cohorte):
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_FORMATIONS")])
 @parser_classes([MultiPartParser, FormParser])
 def vue_televerser_photo_participant(request, id_participant):
     """
@@ -3229,13 +3469,17 @@ def vue_televerser_photo_participant(request, id_participant):
     if photo is None:
         return Response({"erreur": "Fichier manquant (champ 'photo')"}, status=status.HTTP_400_BAD_REQUEST)
 
+    erreur = erreur_image_televersee(photo)
+    if erreur:
+        return Response({"erreur": erreur}, status=status.HTTP_400_BAD_REQUEST)
+
     participant.photo = photo
     participant.save()
     return Response({"photo": participant.photo.url})
 
 
 @api_view(["POST"])
-@permission_classes([EstAdmin])
+@permission_classes([APermission("GERER_MEMBRES")])
 def vue_creer_membre_admin(request):
     """
     POST /api/admin/membre/creer/
@@ -3305,7 +3549,7 @@ def vue_creer_membre_admin(request):
             )
     else:
         # Mode EMAIL : générer un mot de passe aléatoire
-        mot_de_passe = secrets.token_urlsafe(10)
+        mot_de_passe = generer_mot_de_passe_temporaire()
 
     compte = Compte(
         email=email,

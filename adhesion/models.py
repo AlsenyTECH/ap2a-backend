@@ -14,8 +14,11 @@ place pour bénéficier des mécanismes Django intégrés (sessions,
 réinitialisation de mot de passe, admin Django natif, etc.).
 """
 
+import hashlib
 import secrets
+from datetime import timedelta
 
+from django.conf import settings
 from django.db import models
 from django.contrib.auth.hashers import make_password, check_password
 from django.utils import timezone
@@ -480,23 +483,28 @@ class Jeton(models.Model):
     Jeton d'authentification, généré à la connexion et vérifié à
     chaque requête protégée.
 
-    Ce n'est PAS une entité du MCD qu'on a conçu ensemble : c'est un
-    mécanisme purement technique, nécessaire au fonctionnement de
-    l'authentification, sans signification métier pour le parti
-    politique. On la garde donc bien séparée dans sa propre section,
-    pour ne pas polluer le modèle conceptuel qu'on a validé.
+    Ce n'est PAS une entité du MCD : c'est un mécanisme purement
+    technique, nécessaire au fonctionnement de l'authentification.
 
     Simplification volontaire : OneToOneField -> un compte n'a
     qu'UN SEUL jeton actif à la fois. Se reconnecter remplace
     l'ancien jeton (déconnexion automatique de toute autre session,
     par exemple si le membre se connecte sur un nouvel appareil).
+
+    Seule l'EMPREINTE SHA-256 du jeton est stockée, jamais le jeton
+    lui-même : une fuite de la base (sauvegarde, injection SQL...) ne
+    donne aucune session utilisable. Un hachage rapide sans sel suffit
+    ici, contrairement aux mots de passe : le jeton est tiré
+    uniformément sur 256 bits, donc ni dictionnaire ni recherche
+    exhaustive ne sont envisageables - il n'y a rien à ralentir.
     """
 
-    cle = models.CharField(max_length=64, unique=True, editable=False)
+    empreinte = models.CharField(max_length=64, unique=True, editable=False)
     compte = models.OneToOneField(
         Compte, on_delete=models.CASCADE, related_name="jeton"
     )
     date_creation = models.DateTimeField(auto_now_add=True)
+    date_expiration = models.DateTimeField()
 
     class Meta:
         db_table = "JETON"
@@ -511,8 +519,64 @@ class Jeton(models.Model):
         """
         return secrets.token_hex(32)
 
+    @staticmethod
+    def empreinte_de(cle: str) -> str:
+        return hashlib.sha256(cle.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def ouvrir_session(cls, compte) -> str:
+        """
+        Crée (ou remplace) le jeton du compte et retourne la clé EN
+        CLAIR - c'est la seule fois où elle existe côté serveur, elle
+        n'est transmise qu'au client.
+        """
+        cle = cls.generer_cle()
+        cls.objects.update_or_create(
+            compte=compte,
+            defaults={
+                "empreinte": cls.empreinte_de(cle),
+                "date_expiration": timezone.now() + timedelta(hours=settings.JETON_DUREE_VIE_HEURES),
+            },
+        )
+        return cle
+
+    @property
+    def est_expire(self) -> bool:
+        return timezone.now() >= self.date_expiration
+
     def __str__(self):
         return f"Jeton de {self.compte.email}"
+
+
+class TentativeConnexion(models.Model):
+    """
+    Trace des ÉCHECS de connexion, pour limiter la recherche exhaustive
+    de mots de passe (voir vue_connexion). Le compteur porte sur
+    l'identifiant SAISI (qu'il corresponde ou non à un compte, pour ne
+    pas révéler quels comptes existent) et sur l'adresse IP.
+    """
+
+    identifiant = models.CharField(max_length=150, db_index=True)
+    adresse_ip = models.GenericIPAddressField(null=True, blank=True, db_index=True)
+    date_tentative = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "TENTATIVE_CONNEXION"
+
+
+class TicketScanConsomme(models.Model):
+    """
+    Nonces des tickets de scan déjà utilisés (voir tickets.py) : un
+    ticket ne peut confirmer qu'UNE présence. Les lignes plus vieilles
+    que la durée de validité d'un ticket sont purgées au fil de l'eau -
+    au-delà, la signature horodatée du ticket suffit à le rejeter.
+    """
+
+    nonce = models.CharField(max_length=64, unique=True)
+    date_consommation = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "TICKET_SCAN_CONSOMME"
 
 
 # =========================================================================

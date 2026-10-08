@@ -1040,6 +1040,8 @@ class PermissionAdmin(models.Model):
         ("GERER_SUIVI", "Gérer le suivi post-formation"),
         ("GERER_GOUVERNANCE", "Gérer la gouvernance (comptes-rendus du bureau)"),
         ("GERER_COMMUNICATION", "Gérer la communication (actualités publiques)"),
+        ("GERER_REFERENTIELS", "Gérer les référentiels (zones, partenaires, types d'action)"),
+        ("DONNEES_MEDICALES", "Voir et saisir les données médicales"),
     ]
 
     id_permission = models.AutoField(primary_key=True)
@@ -1603,3 +1605,223 @@ class Actualite(models.Model):
 
     def __str__(self):
         return f"Configuration {self.nom_association}"
+
+# =========================================================================
+# RÉFÉRENTIELS DU SUIVI DES ACTIONS (étape 1)
+#
+# L'association enregistre des cibles (personnes, groupes, ASC,
+# établissements, organisations, zones sinistrées) et mène pour elles des
+# actions de natures très différentes (formation, kits scolaires,
+# réhabilitation d'école, appui aux sinistrés, campagne médicale...),
+# souvent avec des partenaires. Ces tables sont le paramétrage commun :
+# où (ZONE), avec qui (PARTENAIRE), quoi (TYPE_ACTION) et comment on
+# mesure (DEFINITION_INDICATEUR, propre à chaque type d'action).
+# =========================================================================
+
+class Zone(models.Model):
+    """
+    Découpage administratif du Sénégal, hiérarchique : région >
+    département > commune > quartier/village. Les 14 régions et 46
+    départements sont préchargés ; communes et quartiers sont ajoutés
+    par l'association au fil de ses interventions.
+    """
+
+    NIVEAU_CHOICES = [
+        ("REGION", "Région"),
+        ("DEPARTEMENT", "Département"),
+        ("COMMUNE", "Commune"),
+        ("QUARTIER", "Quartier / village"),
+    ]
+    # Niveau attendu du parent pour chaque niveau (None = racine).
+    NIVEAU_PARENT = {"REGION": None, "DEPARTEMENT": "REGION", "COMMUNE": "DEPARTEMENT", "QUARTIER": "COMMUNE"}
+
+    id_zone = models.AutoField(primary_key=True)
+    nom = models.CharField(max_length=120)
+    niveau = models.CharField(max_length=20, choices=NIVEAU_CHOICES)
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="sous_zones", db_column="id_zone_parent",
+    )
+    actif = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "ZONE"
+        ordering = ["nom"]
+        constraints = [
+            models.UniqueConstraint(fields=["parent", "niveau", "nom"], name="zone_unique_par_parent"),
+            # Les régions n'ont pas de parent : NULL n'étant égal à rien en
+            # SQL, la contrainte ci-dessus ne les protège pas des doublons.
+            models.UniqueConstraint(
+                fields=["niveau", "nom"], condition=models.Q(parent__isnull=True), name="zone_racine_unique",
+            ),
+        ]
+
+    def chemin(self) -> str:
+        """Ex: "Dakar > Pikine > Thiaroye" (de la région à cette zone)."""
+        noms, zone = [], self
+        while zone is not None:
+            noms.append(zone.nom)
+            zone = zone.parent
+        return " > ".join(reversed(noms))
+
+    def __str__(self):
+        return self.chemin()
+
+
+class Partenaire(models.Model):
+    """
+    Organisation avec laquelle l'association mène ses actions :
+    organisme de formation, structure de santé, bailleur, collectivité...
+    (Les comptes d'accès des partenaires viendront avec l'étape 5.)
+    """
+
+    TYPE_CHOICES = [
+        ("ONG", "ONG / association"),
+        ("ETAT", "Service de l'État"),
+        ("COLLECTIVITE", "Collectivité territoriale"),
+        ("SANTE", "Structure de santé"),
+        ("FORMATION", "Organisme de formation"),
+        ("ENTREPRISE", "Entreprise / secteur privé"),
+        ("BAILLEUR", "Bailleur / fondation"),
+        ("COMMUNAUTAIRE", "Organisation communautaire"),
+        ("AUTRE", "Autre"),
+    ]
+
+    id_partenaire = models.AutoField(primary_key=True)
+    nom = models.CharField(max_length=150, unique=True)
+    sigle = models.CharField(max_length=30, blank=True, default="")
+    type_partenaire = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    domaines = models.CharField(
+        max_length=255, blank=True, default="",
+        help_text="Domaines d'intervention, ex: santé, formation professionnelle",
+    )
+    nom_contact = models.CharField(max_length=150, blank=True, default="")
+    telephone = models.CharField(max_length=30, blank=True, default="")
+    email = models.EmailField(max_length=150, blank=True, default="")
+    adresse = models.CharField(max_length=255, blank=True, default="")
+    zone = models.ForeignKey(
+        Zone, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="partenaires", db_column="id_zone",
+    )
+    notes = models.TextField(blank=True, default="")
+    actif = models.BooleanField(default=True)
+    date_creation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "PARTENAIRE"
+        ordering = ["nom"]
+
+    def __str__(self):
+        return self.nom
+
+
+TYPES_CIBLE_CHOICES = [
+    ("PERSONNE", "Personne"),
+    ("GROUPE", "Groupe (GIE, groupement de femmes, groupe de jeunes...)"),
+    ("ASC", "ASC (association sportive et culturelle)"),
+    ("ETABLISSEMENT", "Établissement (école, poste de santé...)"),
+    ("ORGANISATION", "Organisation"),
+    ("ZONE_SINISTREE", "Zone sinistrée / localité"),
+]
+
+
+class TypeAction(models.Model):
+    """
+    Nature d'une action, paramétrable par un admin : chaque type porte
+    ses propres indicateurs (DefinitionIndicateur) et la liste des types
+    de cibles auxquels il s'adresse.
+    """
+
+    CATEGORIE_CHOICES = [
+        ("FORMATION", "Formation / renforcement de capacités"),
+        ("EDUCATION", "Éducation"),
+        ("SANTE", "Santé"),
+        ("URGENCE", "Urgence / catastrophe"),
+        ("ECONOMIE", "Insertion économique"),
+        ("SOCIAL", "Action sociale / dons"),
+        ("INFRASTRUCTURE", "Infrastructure"),
+        ("AUTRE", "Autre"),
+    ]
+
+    id_type_action = models.AutoField(primary_key=True)
+    code = models.SlugField(max_length=40, unique=True)
+    libelle = models.CharField(max_length=120)
+    description = models.TextField(blank=True, default="")
+    categorie = models.CharField(max_length=20, choices=CATEGORIE_CHOICES, default="AUTRE")
+    types_cible = models.JSONField(
+        default=list,
+        help_text="Codes de TYPES_CIBLE_CHOICES auxquels ce type d'action s'adresse",
+    )
+    # Une action de ce type s'appuie sur le module Formation/Cohorte
+    # (séances, présences, certificats) en plus du suivi générique.
+    est_formation = models.BooleanField(default=False)
+    actif = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "TYPE_ACTION"
+        ordering = ["libelle"]
+
+    def __str__(self):
+        return self.libelle
+
+
+class DefinitionIndicateur(models.Model):
+    """
+    Un indicateur propre à un type d'action, ex: "Kits distribués"
+    (nombre, kits) pour Fournitures scolaires, ou "Issue de la prise en
+    charge" (choix) pour Campagne médicale.
+
+    - moment : quand il est renseigné - situation de RÉFÉRENCE (avant
+      l'action), à l'INTERVENTION, ou lors d'un SUIVI ultérieur.
+    - niveau : pour CHAQUE CIBLE (une valeur par école, par ménage...)
+      ou une seule fois pour l'ACTION entière (budget, nombre de séances).
+    - sensible : donnée médicale/personnelle, visible uniquement avec la
+      permission DONNEES_MEDICALES.
+    """
+
+    TYPE_VALEUR_CHOICES = [
+        ("ENTIER", "Nombre entier"),
+        ("DECIMAL", "Nombre décimal"),
+        ("MONTANT", "Montant (FCFA)"),
+        ("POURCENTAGE", "Pourcentage"),
+        ("BOOLEEN", "Oui / non"),
+        ("CHOIX", "Choix dans une liste"),
+        ("TEXTE", "Texte"),
+        ("DATE", "Date"),
+    ]
+    MOMENT_CHOICES = [
+        ("REFERENCE", "Situation de référence (avant)"),
+        ("INTERVENTION", "Intervention"),
+        ("SUIVI", "Suivi"),
+    ]
+    NIVEAU_CHOICES = [
+        ("CIBLE", "Par cible"),
+        ("ACTION", "Pour l'action entière"),
+    ]
+
+    id_indicateur = models.AutoField(primary_key=True)
+    type_action = models.ForeignKey(
+        TypeAction, on_delete=models.CASCADE, related_name="indicateurs", db_column="id_type_action",
+    )
+    code = models.SlugField(max_length=60)
+    libelle = models.CharField(max_length=150)
+    description = models.TextField(blank=True, default="")
+    type_valeur = models.CharField(max_length=20, choices=TYPE_VALEUR_CHOICES)
+    unite = models.CharField(max_length=30, blank=True, default="")
+    choix = models.JSONField(default=list, blank=True, help_text="Valeurs possibles si type_valeur = CHOIX")
+    moment = models.CharField(max_length=20, choices=MOMENT_CHOICES, default="INTERVENTION")
+    niveau = models.CharField(max_length=10, choices=NIVEAU_CHOICES, default="CIBLE")
+    obligatoire = models.BooleanField(default=False)
+    sensible = models.BooleanField(default=False)
+    ordre = models.PositiveSmallIntegerField(default=0)
+    actif = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "DEFINITION_INDICATEUR"
+        ordering = ["type_action", "moment", "ordre", "id_indicateur"]
+        constraints = [
+            models.UniqueConstraint(fields=["type_action", "code"], name="indicateur_code_unique_par_type"),
+        ]
+
+    def __str__(self):
+        return f"{self.type_action.code}.{self.code}"

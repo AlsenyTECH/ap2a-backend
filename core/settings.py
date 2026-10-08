@@ -260,6 +260,7 @@ REST_FRAMEWORK = {
     # ?format= est utilisé par l'export de rapports (excel|pdf) : DRF ne
     # doit pas l'interpréter comme un choix de renderer (sinon 404).
     "URL_FORMAT_OVERRIDE": None,
+    "EXCEPTION_HANDLER": "adhesion.exceptions.gestionnaire_exceptions",
 }
 
 # ---------------------------------------------------------------------

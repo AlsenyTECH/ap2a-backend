@@ -133,10 +133,9 @@ def fusionner(principale, doublon):
     `doublon`. Les champs vides de la cible principale sont complétés,
     jamais écrasés ; les notes sont mises bout à bout.
 
-    À compléter à chaque nouvelle table qui référence une cible (actions,
-    suivis... dans les étapes suivantes).
+    À compléter à chaque nouvelle table qui référence une cible.
     """
-    from .models import Appartenance
+    from .models import ActionCible, Appartenance, BesoinCible
 
     if principale.pk == doublon.pk:
         raise ValueError("Une cible ne peut pas être fusionnée avec elle-même")
@@ -168,6 +167,17 @@ def fusionner(principale, doublon):
             else:
                 setattr(appartenance, champ_cote, principale)
                 appartenance.save(update_fields=[champ_cote])
+
+    BesoinCible.objects.filter(cible=doublon).update(cible=principale)
+    # Une même action ne peut viser deux fois la même cible : si les deux
+    # fiches y figuraient, on garde la ligne de la cible principale.
+    actions_principale = set(ActionCible.objects.filter(cible=principale).values_list("action_id", flat=True))
+    for ligne in ActionCible.objects.filter(cible=doublon):
+        if ligne.action_id in actions_principale:
+            ligne.delete()
+        else:
+            ligne.cible = principale
+            ligne.save(update_fields=["cible"])
 
     doublon.delete()
     return principale

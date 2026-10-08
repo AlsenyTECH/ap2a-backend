@@ -1033,7 +1033,7 @@ class PermissionAdmin(models.Model):
         ("GERER_MEMBRES", "Gérer les membres"),
         ("GERER_EVENEMENTS", "Gérer les événements"),
         ("GERER_FORMATIONS", "Gérer les formations et cohortes"),
-        ("GERER_ACTIONS_SOCIALES", "Gérer les actions sociales"),
+        ("GERER_ACTIONS_SOCIALES", "Gérer les actions (et anciennes actions sociales)"),
         ("GERER_CONTROLEURS", "Gérer les contrôleurs"),
         ("VOIR_RAPPORTS", "Voir les rapports et statistiques"),
         ("IMPORTER_DONNEES", "Importer des données Excel"),
@@ -1940,4 +1940,240 @@ class Appartenance(models.Model):
         db_table = "APPARTENANCE"
         constraints = [
             models.UniqueConstraint(fields=["personne", "collectif"], name="appartenance_unique"),
+        ]
+
+
+# =========================================================================
+# ACTIONS (étape 3) : l'association définit des cibles, identifie leurs
+# besoins, puis organise les actions qui y répondent - avant (équipe,
+# partenaires, tâches, budget), pendant (cibles servies, présences,
+# indicateurs) et après (bilan).
+# =========================================================================
+
+class BesoinCible(models.Model):
+    """Ce dont une cible a besoin ("toilettes à refaire", "kits scolaires")."""
+
+    PRIORITE_CHOICES = [
+        ("BASSE", "Basse"),
+        ("MOYENNE", "Moyenne"),
+        ("HAUTE", "Haute"),
+        ("URGENTE", "Urgente"),
+    ]
+    STATUT_CHOICES = [
+        ("IDENTIFIE", "Identifié"),
+        ("PLANIFIE", "Action planifiée"),
+        ("COUVERT", "Couvert"),
+        ("ABANDONNE", "Abandonné"),
+    ]
+
+    id_besoin = models.AutoField(primary_key=True)
+    cible = models.ForeignKey(Cible, on_delete=models.CASCADE, related_name="besoins", db_column="id_cible")
+    type_action = models.ForeignKey(
+        TypeAction, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="besoins", db_column="id_type_action",
+        help_text="Type d'action qui y répondrait (facultatif)",
+    )
+    description = models.CharField(max_length=255)
+    priorite = models.CharField(max_length=10, choices=PRIORITE_CHOICES, default="MOYENNE")
+    statut = models.CharField(max_length=10, choices=STATUT_CHOICES, default="IDENTIFIE")
+    date_identification = models.DateField(default=timezone.localdate)
+    identifie_par = models.ForeignKey(
+        Compte, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="besoins_identifies", db_column="id_compte",
+    )
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "BESOIN_CIBLE"
+        ordering = ["statut", "-date_identification"]
+
+    def __str__(self):
+        return f"{self.cible} : {self.description}"
+
+
+class Action(models.Model):
+    STATUT_CHOICES = [
+        ("BROUILLON", "En préparation"),
+        ("PLANIFIEE", "Planifiée"),
+        ("EN_COURS", "En cours"),
+        ("TERMINEE", "Terminée"),
+        ("ANNULEE", "Annulée"),
+    ]
+    # Transitions permises : on ne revient pas en arrière une fois
+    # l'action terminée ou annulée.
+    TRANSITIONS = {
+        "BROUILLON": {"PLANIFIEE", "ANNULEE"},
+        "PLANIFIEE": {"BROUILLON", "EN_COURS", "ANNULEE"},
+        "EN_COURS": {"TERMINEE", "ANNULEE"},
+        "TERMINEE": set(),
+        "ANNULEE": set(),
+    }
+
+    id_action = models.AutoField(primary_key=True)
+    titre = models.CharField(max_length=200)
+    type_action = models.ForeignKey(
+        TypeAction, on_delete=models.PROTECT, related_name="actions", db_column="id_type_action",
+    )
+    description = models.TextField(blank=True, default="")
+    statut = models.CharField(max_length=10, choices=STATUT_CHOICES, default="BROUILLON")
+    date_debut = models.DateField()
+    date_fin = models.DateField(null=True, blank=True)
+    lieu = models.CharField(max_length=255, blank=True, default="")
+    zone = models.ForeignKey(
+        Zone, null=True, blank=True, on_delete=models.SET_NULL, related_name="actions", db_column="id_zone",
+    )
+    responsable = models.ForeignKey(
+        Membre, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="actions_responsable", db_column="id_membre_responsable",
+    )
+    budget_prevu = models.DecimalField(max_digits=14, decimal_places=0, null=True, blank=True)
+    budget_realise = models.DecimalField(max_digits=14, decimal_places=0, null=True, blank=True)
+    # Les membres peuvent se proposer depuis leur espace.
+    appel_volontaires = models.BooleanField(default=False)
+    volontaires_souhaites = models.PositiveIntegerField(null=True, blank=True)
+    bilan = models.TextField(blank=True, default="")
+    date_creation = models.DateTimeField(auto_now_add=True)
+    cree_par = models.ForeignKey(
+        Compte, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="actions_creees", db_column="id_compte_createur",
+    )
+
+    class Meta:
+        db_table = "ACTION"
+        ordering = ["-date_debut", "-id_action"]
+
+    def __str__(self):
+        return self.titre
+
+
+class ActionPartenaire(models.Model):
+    ROLE_CHOICES = [
+        ("FORMATEUR", "Formateur / opérateur de formation"),
+        ("PRESTATAIRE", "Prestataire (médical, travaux...)"),
+        ("FINANCEUR", "Financeur"),
+        ("SOUTIEN", "Soutien technique ou logistique"),
+        ("AUTRE", "Autre"),
+    ]
+
+    id_action_partenaire = models.AutoField(primary_key=True)
+    action = models.ForeignKey(Action, on_delete=models.CASCADE, related_name="partenaires", db_column="id_action")
+    partenaire = models.ForeignKey(
+        Partenaire, on_delete=models.PROTECT, related_name="participations", db_column="id_partenaire",
+    )
+    role = models.CharField(max_length=15, choices=ROLE_CHOICES, default="AUTRE")
+    montant_apport = models.DecimalField(max_digits=14, decimal_places=0, null=True, blank=True)
+    notes = models.CharField(max_length=255, blank=True, default="")
+
+    class Meta:
+        db_table = "ACTION_PARTENAIRE"
+        constraints = [models.UniqueConstraint(fields=["action", "partenaire"], name="action_partenaire_unique")]
+
+
+class ActionCible(models.Model):
+    """Une cible concernée par l'action, et ce qui a été fait pour elle."""
+
+    STATUT_CHOICES = [
+        ("PREVUE", "Prévue"),
+        ("SERVIE", "Servie"),
+        ("ABSENTE", "Absente / non servie"),
+    ]
+
+    id_action_cible = models.AutoField(primary_key=True)
+    action = models.ForeignKey(Action, on_delete=models.CASCADE, related_name="cibles", db_column="id_action")
+    cible = models.ForeignKey(Cible, on_delete=models.PROTECT, related_name="actions", db_column="id_cible")
+    besoin = models.ForeignKey(
+        BesoinCible, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="interventions", db_column="id_besoin",
+    )
+    statut = models.CharField(max_length=10, choices=STATUT_CHOICES, default="PREVUE")
+    date_intervention = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "ACTION_CIBLE"
+        constraints = [models.UniqueConstraint(fields=["action", "cible"], name="action_cible_unique")]
+
+
+class MembreEquipe(models.Model):
+    """Un membre de l'association mobilisé sur l'action."""
+
+    STATUT_CHOICES = [
+        ("PROPOSE", "Volontaire, en attente"),
+        ("CONFIRME", "Confirmé"),
+        ("DECLINE", "Non retenu / désisté"),
+    ]
+
+    id_membre_equipe = models.AutoField(primary_key=True)
+    action = models.ForeignKey(Action, on_delete=models.CASCADE, related_name="equipe", db_column="id_action")
+    membre = models.ForeignKey(Membre, on_delete=models.CASCADE, related_name="missions", db_column="id_membre")
+    role = models.CharField(max_length=100, blank=True, default="")
+    statut = models.CharField(max_length=10, choices=STATUT_CHOICES, default="CONFIRME")
+    volontaire = models.BooleanField(default=False, help_text="S'est proposé lui-même")
+    present = models.BooleanField(null=True, blank=True, help_text="Présence le jour J")
+    date_ajout = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "MEMBRE_EQUIPE"
+        constraints = [models.UniqueConstraint(fields=["action", "membre"], name="membre_equipe_unique")]
+
+
+class TacheAction(models.Model):
+    PHASE_CHOICES = [
+        ("AVANT", "Avant (préparation)"),
+        ("PENDANT", "Pendant"),
+        ("APRES", "Après (clôture, suivi)"),
+    ]
+
+    id_tache = models.AutoField(primary_key=True)
+    action = models.ForeignKey(Action, on_delete=models.CASCADE, related_name="taches", db_column="id_action")
+    titre = models.CharField(max_length=200)
+    phase = models.CharField(max_length=10, choices=PHASE_CHOICES, default="AVANT")
+    responsable = models.ForeignKey(
+        Membre, null=True, blank=True, on_delete=models.SET_NULL, related_name="taches", db_column="id_membre",
+    )
+    echeance = models.DateField(null=True, blank=True)
+    faite = models.BooleanField(default=False)
+    date_faite = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "TACHE_ACTION"
+        ordering = ["faite", "echeance", "id_tache"]
+
+
+class ValeurIndicateur(models.Model):
+    """
+    Valeur saisie pour un indicateur du type de l'action : pour une cible
+    (action_cible renseigné) ou pour l'action entière. Une colonne typée
+    par nature de valeur, pour pouvoir additionner et comparer.
+    """
+
+    id_valeur = models.AutoField(primary_key=True)
+    indicateur = models.ForeignKey(
+        DefinitionIndicateur, on_delete=models.PROTECT, related_name="valeurs", db_column="id_indicateur",
+    )
+    action = models.ForeignKey(Action, on_delete=models.CASCADE, related_name="valeurs", db_column="id_action")
+    action_cible = models.ForeignKey(
+        ActionCible, null=True, blank=True, on_delete=models.CASCADE,
+        related_name="valeurs", db_column="id_action_cible",
+    )
+    valeur_nombre = models.DecimalField(max_digits=16, decimal_places=2, null=True, blank=True)
+    valeur_texte = models.TextField(blank=True, default="")
+    valeur_booleen = models.BooleanField(null=True, blank=True)
+    valeur_date = models.DateField(null=True, blank=True)
+    saisi_par = models.ForeignKey(
+        Compte, null=True, blank=True, on_delete=models.SET_NULL, related_name="valeurs_saisies", db_column="id_compte",
+    )
+    date_saisie = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "VALEUR_INDICATEUR"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["indicateur", "action_cible"], condition=models.Q(action_cible__isnull=False),
+                name="valeur_unique_par_cible",
+            ),
+            models.UniqueConstraint(
+                fields=["indicateur", "action"], condition=models.Q(action_cible__isnull=True),
+                name="valeur_unique_par_action",
+            ),
         ]

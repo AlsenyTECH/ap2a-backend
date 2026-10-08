@@ -22,6 +22,15 @@ class DonneesInitialesTests(TestCase):
         pikine = Zone.objects.get(nom="Pikine", niveau="DEPARTEMENT")
         self.assertEqual(pikine.chemin(), "Dakar > Pikine")
 
+    def test_communes_de_dakar_et_unites_des_parcelles(self):
+        dakar = Zone.objects.get(nom="Dakar", niveau="DEPARTEMENT")
+        self.assertEqual(dakar.sous_zones.filter(niveau="COMMUNE").count(), 19)
+        unites = Zone.objects.filter(parent__nom="Parcelles Assainies", niveau="QUARTIER")
+        self.assertEqual(unites.count(), 26)
+        self.assertEqual(
+            Zone.objects.get(nom="Unité 17").chemin(), "Dakar > Dakar > Parcelles Assainies > Unité 17"
+        )
+
     def test_types_et_indicateurs(self):
         self.assertEqual(TypeAction.objects.count(), len(TYPES_ACTION))
         medical = TypeAction.objects.get(code="campagne-medicale")
@@ -51,6 +60,14 @@ class ZonesTests(TestCase):
         self.assertEqual({d["nom"] for d in departements}, set(REGIONS_DEPARTEMENTS["Dakar"]))
         recherche = client.get("/api/referentiels/zones/", {"q": "pik"}).data
         self.assertEqual([z["chemin"] for z in recherche], ["Dakar > Pikine"])
+
+    def test_recherche_sans_accents_et_abreviation(self):
+        client = client_pour(creer_compte())
+        chemins = lambda q: [z["chemin"] for z in client.get("/api/referentiels/zones/", {"q": q}).data]
+        self.assertIn("Dakar > Dakar > Parcelles Assainies > Unité 17", chemins("unite 17"))
+        self.assertEqual(chemins("U17"), ["Dakar > Dakar > Parcelles Assainies > Unité 17"])
+        self.assertEqual(chemins("u 1"), ["Dakar > Dakar > Parcelles Assainies > Unité 1"])
+        self.assertIn("Dakar > Dakar > Cambérène", chemins("camberene"))
 
     def test_creation_commune_et_quartier(self):
         commune = self.creer(nom="Thiaroye-sur-Mer", niveau="COMMUNE", parent=self.pikine.id_zone)

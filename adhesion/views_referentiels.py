@@ -9,6 +9,8 @@ Lecture : tout compte connecté pour les zones et types d'action
 Écriture : permission GERER_REFERENTIELS.
 """
 
+import re
+
 from django.db import IntegrityError
 from django.db.models import Count, ProtectedError
 from django.utils.text import slugify
@@ -16,6 +18,7 @@ from rest_framework import serializers, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
+from .cibles import normaliser_texte
 from .models import (
     TYPES_CIBLE_CHOICES, DefinitionIndicateur, JournalAudit, Partenaire, TypeAction, Zone,
 )
@@ -100,7 +103,18 @@ def vue_liste_zones(request):
     niveau = request.query_params.get("niveau")
 
     if q:
-        zones = zones.filter(nom__icontains=q)
+        # Sans accents ni casse, et "U17" pour "Unité 17" (usage courant aux
+        # Parcelles Assainies). Le référentiel reste petit : filtrage en Python.
+        recherche = normaliser_texte(q)
+        abreviation = re.fullmatch(r"u ?(\d+)", recherche)
+        if abreviation:
+            recherche = f"unite {abreviation.group(1)}"
+        ids = [
+            z.id_zone for z in Zone.objects.only("id_zone", "nom")
+            if recherche in normaliser_texte(z.nom)
+            and (not abreviation or normaliser_texte(z.nom) == recherche)
+        ]
+        zones = zones.filter(id_zone__in=ids)
     elif parent and parent != "racine":
         zones = zones.filter(parent_id=parent)
     elif not niveau:

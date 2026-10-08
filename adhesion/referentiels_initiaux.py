@@ -34,6 +34,26 @@ REGIONS_DEPARTEMENTS = {
     "Ziguinchor": ["Bignona", "Oussouye", "Ziguinchor"],
 }
 
+# Communes d'arrondissement du département de Dakar (19), par
+# arrondissement : Almadies, Grand Dakar, Parcelles Assainies, Plateau/Gorée.
+COMMUNES = {
+    ("Dakar", "Dakar"): [
+        "Ngor", "Ouakam", "Yoff", "Mermoz-Sacré-Cœur",
+        "Grand Dakar", "Biscuiterie", "HLM", "Hann Bel-Air", "Sicap-Liberté", "Dieuppeul-Derklé",
+        "Parcelles Assainies", "Cambérène", "Grand Yoff", "Patte d'Oie",
+        "Plateau", "Gorée", "Médina", "Fann-Point E-Amitié", "Gueule Tapée-Fass-Colobane",
+    ],
+}
+
+# Quartiers préchargés, par (région, département, commune). Les Parcelles
+# Assainies sont découpées en unités numérotées : les Unités 1 à 26
+# forment le site d'origine (1974). Le plan de développement communal
+# 2021-2025 ne compte que les Unités 7 à 26 dans la commune ; une unité se
+# rattache à une autre commune depuis Référentiels > Zones si besoin.
+QUARTIERS = {
+    ("Dakar", "Dakar", "Parcelles Assainies"): [f"Unité {numero}" for numero in range(1, 27)],
+}
+
 ETAT_BATIMENT = ["Bon", "Moyen", "Dégradé", "Inutilisable"]
 
 

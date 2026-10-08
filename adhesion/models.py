@@ -1042,6 +1042,7 @@ class PermissionAdmin(models.Model):
         ("GERER_COMMUNICATION", "Gérer la communication (actualités publiques)"),
         ("GERER_REFERENTIELS", "Gérer les référentiels (zones, partenaires, types d'action)"),
         ("DONNEES_MEDICALES", "Voir et saisir les données médicales"),
+        ("GERER_CIBLES", "Gérer les cibles (personnes, groupes, établissements...)"),
     ]
 
     id_permission = models.AutoField(primary_key=True)
@@ -1825,3 +1826,118 @@ class DefinitionIndicateur(models.Model):
 
     def __str__(self):
         return f"{self.type_action.code}.{self.code}"
+
+
+# =========================================================================
+# CIBLES (étape 2) : qui bénéficie des actions de l'association.
+#
+# Une seule notion pour six natures très différentes : une personne, un
+# groupe (GIE, groupement de femmes...), une ASC, un établissement (école,
+# poste de santé), une organisation, ou une zone sinistrée. Une cible a un
+# historique : plusieurs actions dans le temps (fournitures puis
+# réhabilitation pour une même école...).
+# =========================================================================
+
+class Cible(models.Model):
+    SEXE_CHOICES = [("M", "Masculin"), ("F", "Féminin")]
+
+    id_cible = models.AutoField(primary_key=True)
+    type_cible = models.CharField(max_length=20, choices=TYPES_CIBLE_CHOICES)
+    # Personne : nom de famille. Autres types : nom de la cible
+    # ("École élémentaire de Thiaroye 2", "GIE Jappo"...).
+    nom = models.CharField(max_length=150)
+    # Champs propres aux personnes.
+    prenom = models.CharField(max_length=100, blank=True, default="")
+    sexe = models.CharField(max_length=1, choices=SEXE_CHOICES, blank=True, default="")
+    date_naissance = models.DateField(null=True, blank=True)
+    numero_identification = models.CharField(
+        max_length=50, blank=True, default="", help_text="CNI ou autre pièce (optionnel)",
+    )
+    # Champs propres aux collectifs (groupe, ASC, établissement...).
+    sous_type = models.CharField(
+        max_length=100, blank=True, default="",
+        help_text="Précision libre : école élémentaire, GIE, groupement de femmes, daara...",
+    )
+    responsable = models.CharField(max_length=150, blank=True, default="")
+    effectif = models.PositiveIntegerField(
+        null=True, blank=True, help_text="Membres, élèves, habitants... selon le type",
+    )
+    # Contact et localisation, communs à tous.
+    telephone = models.CharField(max_length=30, blank=True, default="")
+    # Formes normalisées (sans accents ni casse, téléphone sans +221),
+    # calculées à l'enregistrement : dédoublonnage et recherche.
+    telephone_normalise = models.CharField(max_length=20, blank=True, default="", db_index=True, editable=False)
+    nom_normalise = models.CharField(max_length=150, blank=True, default="", db_index=True, editable=False)
+    prenom_normalise = models.CharField(max_length=100, blank=True, default="", editable=False)
+    email = models.EmailField(max_length=150, blank=True, default="")
+    zone = models.ForeignKey(
+        Zone, null=True, blank=True, on_delete=models.SET_NULL, related_name="cibles", db_column="id_zone",
+    )
+    adresse = models.CharField(max_length=255, blank=True, default="")
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    notes = models.TextField(blank=True, default="")
+
+    # Liens avec l'existant : membre de l'association, et bénéficiaire
+    # des anciennes actions sociales repris lors de la migration.
+    membre = models.OneToOneField(
+        Membre, null=True, blank=True, on_delete=models.SET_NULL, related_name="cible", db_column="id_membre",
+    )
+    beneficiaire_origine = models.OneToOneField(
+        Beneficiaire, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="cible", db_column="id_beneficiaire",
+    )
+
+    actif = models.BooleanField(default=True)
+    date_creation = models.DateTimeField(auto_now_add=True)
+    cree_par = models.ForeignKey(
+        Compte, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="cibles_creees", db_column="id_compte_createur",
+    )
+
+    class Meta:
+        db_table = "CIBLE"
+        ordering = ["nom", "prenom"]
+        indexes = [models.Index(fields=["type_cible", "nom"])]
+
+    @property
+    def est_personne(self) -> bool:
+        return self.type_cible == "PERSONNE"
+
+    @property
+    def nom_complet(self) -> str:
+        return f"{self.prenom} {self.nom}".strip() if self.est_personne else self.nom
+
+    def save(self, *args, **kwargs):
+        from .cibles import normaliser_telephone, normaliser_texte
+        self.telephone_normalise = normaliser_telephone(self.telephone)
+        self.nom_normalise = normaliser_texte(self.nom)
+        self.prenom_normalise = normaliser_texte(self.prenom)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.nom_complet
+
+
+class Appartenance(models.Model):
+    """
+    Une personne fait partie d'un collectif : membre d'un GIE ou d'une
+    ASC, élève d'une école, habitant d'une zone sinistrée...
+    """
+
+    id_appartenance = models.AutoField(primary_key=True)
+    personne = models.ForeignKey(
+        Cible, on_delete=models.CASCADE, related_name="appartenances", db_column="id_cible_personne",
+    )
+    collectif = models.ForeignKey(
+        Cible, on_delete=models.CASCADE, related_name="membres_collectif", db_column="id_cible_collectif",
+    )
+    role = models.CharField(max_length=100, blank=True, default="", help_text="Présidente, élève, trésorier...")
+    date_debut = models.DateField(null=True, blank=True)
+    date_fin = models.DateField(null=True, blank=True)
+
+    class Meta:
+        db_table = "APPARTENANCE"
+        constraints = [
+            models.UniqueConstraint(fields=["personne", "collectif"], name="appartenance_unique"),
+        ]

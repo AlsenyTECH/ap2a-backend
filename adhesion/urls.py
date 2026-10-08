@@ -9,6 +9,7 @@ from django.urls import path
 from . import views
 from . import views_nouveaux_modules as vnm
 from . import views_referentiels as vr
+from . import views_cibles as vc
 
 urlpatterns = [
     # --- Public / membre ---
@@ -350,4 +351,14 @@ urlpatterns = [
         name="creer_indicateur",
     ),
     path("admin/indicateurs/<int:id_indicateur>/", vr.vue_gerer_indicateur, name="gerer_indicateur"),
+
+    # --- Cibles (personnes, groupes, ASC, établissements, organisations, zones sinistrées) ---
+    path("admin/cibles/", vc.vue_cibles, name="cibles"),
+    path("admin/cibles/verifier-doublons/", vc.vue_verifier_doublons, name="verifier_doublons_cibles"),
+    path("admin/cibles/importer-excel/", vc.vue_importer_cibles, name="importer_cibles"),
+    path("admin/cibles/modele-excel/", vc.vue_modele_import_cibles, name="modele_import_cibles"),
+    path("admin/cibles/<int:id_cible>/", vc.vue_cible, name="cible"),
+    path("admin/cibles/<int:id_cible>/appartenances/", vc.vue_ajouter_appartenance, name="ajouter_appartenance"),
+    path("admin/cibles/<int:id_cible>/fusionner/", vc.vue_fusionner, name="fusionner_cibles"),
+    path("admin/appartenances/<int:id_appartenance>/", vc.vue_supprimer_appartenance, name="supprimer_appartenance"),
 ]

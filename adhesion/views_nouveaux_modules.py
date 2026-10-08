@@ -38,11 +38,11 @@ from .models import (
 )
 from .permissions import (
     EstAuthentifie, EstMembre, EstAdmin, EstSuperAdmin,
-    PeutControler, APermission,
+    PeutControler, APermission, compte_a_permission,
 )
 from .utils import (
     est_email_reel, synchroniser_statuts_cohortes, erreur_si_cohorte_verrouillee,
-    envoyer_email_arriere_plan,
+    envoyer_email_arriere_plan, generer_mot_de_passe_temporaire,
 )
 
 
@@ -1331,9 +1331,7 @@ def vue_comptes_rendus(request):
         comptes_rendus = CompteRendu.objects.select_related("cree_par").all()
         return Response([_serialiser_compte_rendu(cr) for cr in comptes_rendus])
 
-    if not (request.user.est_super_admin or PermissionAdmin.objects.filter(
-        compte=request.user, code_permission="GERER_GOUVERNANCE"
-    ).exists()):
+    if not compte_a_permission(request.user, "GERER_GOUVERNANCE"):
         return Response({"erreur": "Permission refusée"}, status=status.HTTP_403_FORBIDDEN)
 
     donnees = request.data
@@ -1373,10 +1371,7 @@ def vue_detail_compte_rendu(request, id_compte_rendu):
     if request.method == "GET":
         return Response(_serialiser_compte_rendu(compte_rendu))
 
-    a_la_permission = request.user.est_super_admin or PermissionAdmin.objects.filter(
-        compte=request.user, code_permission="GERER_GOUVERNANCE"
-    ).exists()
-    if not a_la_permission:
+    if not compte_a_permission(request.user, "GERER_GOUVERNANCE"):
         return Response({"erreur": "Permission refusée"}, status=status.HTTP_403_FORBIDDEN)
 
     if request.method == "DELETE":
@@ -1473,8 +1468,11 @@ def vue_importer_membres_excel(request):
         fonction_brute = str(ligne[5] or "").strip().upper() if len(ligne) > 5 else ""
         fonction_association = fonction_brute if fonction_brute in dict(Membre.FONCTION_CHOICES) else "MEMBRE_ACTIF"
 
-        # Mot de passe temporaire
-        mot_de_passe_temp = f"AP2A-{prenom[:3].upper()}{nom[:3].upper()}"
+        # Mot de passe temporaire ALÉATOIRE, jamais communiqué : l'ancien
+        # format (AP2A- + 3 lettres du prénom + 3 du nom) se devinait à
+        # partir de l'annuaire. Le membre reçoit ses vrais identifiants
+        # via "Renvoyer les identifiants", qui en régénère un.
+        mot_de_passe_temp = generer_mot_de_passe_temporaire()
 
         compte = Compte.objects.create(
             email=email,
@@ -1587,17 +1585,35 @@ def vue_telecharger_certificat_participant(request, id_cohorte, id_participant):
     """
     GET /api/cohorte/<id_cohorte>/certificat/<id_participant>/
     Génère et renvoie le PDF du certificat pour un participant.
-    Accessible par l'admin ou le participant lui-même.
+    Accessible aux gestionnaires des formations, ou au participant
+    lui-même (via son compte membre lié) - jamais à un autre membre qui
+    ferait varier les identifiants dans l'URL.
     """
     from django.http import HttpResponse
     from .certificats import generer_certificat_pdf
 
     try:
         cohorte = Cohorte.objects.select_related("formation").get(pk=id_cohorte)
-        participant = Participant.objects.get(pk=id_participant)
+        participant = Participant.objects.select_related("membre").get(pk=id_participant)
     except (Cohorte.DoesNotExist, Participant.DoesNotExist):
         return Response(
             {"erreur": "Cohorte ou participant introuvable"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    est_gestionnaire = compte_a_permission(request.user, "GERER_FORMATIONS")
+    est_titulaire = participant.membre is not None and participant.membre.compte_id == request.user.id_compte
+    if not (est_gestionnaire or est_titulaire):
+        # 404 plutôt que 403 : ne pas confirmer l'existence du couple
+        # cohorte/participant à quelqu'un qui n'y a pas droit.
+        return Response(
+            {"erreur": "Cohorte ou participant introuvable"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    if not InscriptionCohorte.objects.filter(cohorte=cohorte, participant=participant).exists():
+        return Response(
+            {"erreur": "Ce participant n'est pas inscrit à cette cohorte"},
             status=status.HTTP_404_NOT_FOUND,
         )
 
@@ -1617,7 +1633,7 @@ def vue_telecharger_certificat_participant(request, id_cohorte, id_participant):
     taux = (presences_validees / seances_total) * 100
     seuil = cohorte.seuil_certification or 75
 
-    if taux < seuil and not request.user.est_admin:
+    if taux < seuil and not est_gestionnaire:
         return Response(
             {
                 "erreur": f"Taux de présence insuffisant ({taux:.0f}% < {seuil}% requis)",
@@ -2084,7 +2100,7 @@ def vue_renvoyer_identifiants_membre(request, id_membre):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    nouveau_mdp = f"AP2A-{secrets.randbelow(900000) + 100000}"
+    nouveau_mdp = generer_mot_de_passe_temporaire()
 
     compte.mot_de_passe_hash = make_password(nouveau_mdp)
     compte.doit_changer_mot_de_passe = True

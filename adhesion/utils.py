@@ -2,114 +2,134 @@
 adhesion/utils.py
 
 Génération et vérification de la signature HMAC apposée sur chaque
-carte (QR ou NFC), avec support de la rotation de clé versionnée.
+carte (QR ou NFC) et chaque badge de participant, avec support de la
+rotation de clé versionnée.
 
-Rappel du principe (voir discussion) :
+Rappel du principe :
 - Le contenu encodé sur la carte est : uuid + version + signature
 - La signature prouve que le serveur (et lui seul, car il détient
   la clé secrète) a bien émis cette carte pour cet UUID précis.
 - La signature n'est JAMAIS stockée en base : elle est recalculée
   à la volée à chaque scan.
+
+Séparation de domaine : la même clé K signe trois types d'objets
+différents (carte de membre statique, QR rotatif, badge de
+participant). Pour qu'une signature valide dans un contexte ne puisse
+JAMAIS être rejouée dans un autre, chaque message signé commence par
+une étiquette de domaine fixe :
+
+    HMAC(K, "AP2A|carte|<uuid>")
+    HMAC(K, "AP2A|badge|<uuid>")
+    HMAC(K, "AP2A|rotatif|<uuid>|<fenetre>")
+
+Le séparateur "|" n'apparaît jamais dans un UUID canonique ni dans un
+entier, donc l'encodage est injectif : deux messages de domaines
+différents ne peuvent pas être égaux.
+
+Compatibilité : les cartes NFC et badges imprimés AVANT l'ajout des
+étiquettes ont été signés sur l'UUID nu - HMAC(K, "<uuid>"). Tant que
+HMAC_ACCEPTER_SIGNATURES_HERITEES est vrai, la vérification accepte
+encore ce format (et le journalise) pour les supports STATIQUES
+uniquement. Une fois tous les supports réémis, passer ce réglage à
+False supprime définitivement le format sans domaine.
 """
 
 import hmac
 import hashlib
+import logging
+import secrets
 import time
 import threading
 
 from django.conf import settings
 
+logger = logging.getLogger(__name__)
 
-def generer_signature(uuid_carte: str) -> tuple[str, int]:
+DOMAINE_CARTE = "AP2A|carte"
+DOMAINE_BADGE = "AP2A|badge"
+DOMAINE_ROTATIF = "AP2A|rotatif"
+
+DOMAINES_STATIQUES = (DOMAINE_CARTE, DOMAINE_BADGE)
+
+
+def _cle_pour_version(version: int) -> bytes | None:
+    """Clé du trousseau pour cette version, ou None si inconnue/révoquée."""
+    cle = settings.HMAC_CLES.get(version)
+    return cle.encode("utf-8") if cle else None
+
+
+def _hmac_hex(cle: bytes, message: str) -> str:
+    return hmac.new(cle, message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _message_statique(domaine: str, uuid_carte: str) -> str:
+    if domaine not in DOMAINES_STATIQUES:
+        raise ValueError(f"Domaine de signature statique inconnu : {domaine}")
+    return f"{domaine}|{uuid_carte}"
+
+
+def generer_signature(uuid_carte: str, domaine: str = DOMAINE_CARTE) -> tuple[str, int]:
     """
-    Calcule la signature HMAC pour un UUID de carte, en utilisant
-    la clé actuellement active (HMAC_VERSION_ACTIVE dans settings).
-
-    Appelée UNE SEULE FOIS, au moment de la création d'une carte
-    (inscription, ou réémission après perte).
+    Calcule la signature HMAC d'un support statique (carte de membre
+    ou badge de participant), avec la clé active (HMAC_VERSION_ACTIVE).
 
     Retourne un tuple (signature_hexadecimale, numero_version),
     les deux à encoder ensemble sur le QR/la puce.
     """
     version = settings.HMAC_VERSION_ACTIVE
-    cle_secrete = settings.HMAC_CLES[version]
-
-    signature = hmac.new(
-        key=cle_secrete.encode("utf-8"),
-        msg=uuid_carte.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-
+    signature = _hmac_hex(_cle_pour_version(version), _message_statique(domaine, uuid_carte))
     return signature, version
 
 
-def verifier_signature(uuid_carte: str, signature_recue: str, version_recue: int) -> bool:
+def verifier_signature(
+    uuid_carte: str, signature_recue: str, version_recue: int, domaine: str = DOMAINE_CARTE
+) -> bool:
     """
-    Vérifie qu'une signature reçue lors d'un scan correspond bien
-    à l'UUID annoncé, pour la version de clé indiquée.
-
-    Appelée À CHAQUE scan, avant toute recherche en base de données.
-
-    Retourne True si la signature est valide, False sinon.
+    Vérifie la signature d'un support statique pour le domaine attendu
+    (carte de membre ou badge). Appelée À CHAQUE scan, avant toute
+    recherche en base de données.
     """
     # La version reçue doit correspondre à une clé que le serveur
     # connaît encore. Si la clé a été retirée du trousseau (ancienne
     # version révoquée), on rejette sans planter.
-    cle_secrete = settings.HMAC_CLES.get(version_recue)
-    if cle_secrete is None:
+    cle = _cle_pour_version(version_recue)
+    if cle is None:
         return False
-
-    signature_attendue = hmac.new(
-        key=cle_secrete.encode("utf-8"),
-        msg=uuid_carte.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
 
     # Comparaison en temps constant : ne JAMAIS utiliser "==" ici.
     # Une comparaison naïve s'arrête au premier caractère différent,
     # ce qui fait varier le temps de réponse selon combien de
     # caractères sont corrects - une faille exploitable par mesure
     # de timing pour deviner la signature progressivement.
-    return hmac.compare_digest(signature_attendue, signature_recue)
+    attendue = _hmac_hex(cle, _message_statique(domaine, uuid_carte))
+    if hmac.compare_digest(attendue, signature_recue):
+        return True
+
+    if settings.HMAC_ACCEPTER_SIGNATURES_HERITEES:
+        heritee = _hmac_hex(cle, uuid_carte)
+        if hmac.compare_digest(heritee, signature_recue):
+            logger.info("Signature héritée (sans domaine) acceptée pour %s %s", domaine, uuid_carte)
+            return True
+
+    return False
 
 
-def construire_contenu_carte(uuid_carte: str) -> str:
+def construire_contenu_carte(uuid_carte: str, domaine: str = DOMAINE_CARTE) -> str:
     """
     Construit la chaîne complète à encoder sur le QR/la puce NFC :
     uuid.version.signature
 
     Le point "." sert de séparateur simple pour pouvoir décomposer
-    la chaîne facilement côté application Flutter au moment du scan.
+    la chaîne facilement côté application au moment du scan.
     """
-    signature, version = generer_signature(uuid_carte)
-    return f"{uuid_carte}.{version}.{signature}"
-
-
-def reconstruire_contenu_carte(uuid_carte: str, version: int) -> str:
-    """
-    Reconstruit le contenu d'une carte DÉJÀ EXISTANTE, en utilisant la
-    version de clé qui a servi à la signer à l'origine (Carte.id_version_cle),
-    pas forcément la version active actuelle.
-
-    Nécessaire par exemple pour réafficher le QR d'un membre dans son
-    espace virtuel après une rotation de clé : si sa carte a été signée
-    en version 1 mais que le serveur signe désormais en version 2, il
-    faut continuer à afficher le contenu signé en version 1, sinon la
-    signature affichée ne correspondrait plus à ce qui a été imprimé.
-    """
-    cle_secrete = settings.HMAC_CLES[version]
-    signature = hmac.new(
-        key=cle_secrete.encode("utf-8"),
-        msg=uuid_carte.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
+    signature, version = generer_signature(uuid_carte, domaine)
     return f"{uuid_carte}.{version}.{signature}"
 
 
 def decomposer_contenu_carte(contenu_scanne):
     """
-    Fait l'opération inverse : à partir de ce que Flutter a lu sur
-    le QR/la puce, sépare l'UUID, la version et la signature.
+    Fait l'opération inverse : à partir de ce qui a été lu sur le
+    QR/la puce, sépare l'UUID, la version et la signature.
 
     Retourne None si le format est invalide (carte corrompue,
     QR d'un autre système, etc.) plutôt que de planter.
@@ -129,9 +149,9 @@ def decomposer_contenu_carte(contenu_scanne):
 
 # =====================================================================
 # QR ROTATIF (carte virtuelle uniquement) : le contenu change toutes
-# les 10 secondes, contrairement au QR statique imprimé sur une carte
+# les 10 secondes, contrairement au contenu statique d'une carte
 # physique. Principe proche d'un code TOTP (type Google Authenticator) :
-# on signe "uuid:fenêtre_de_temps" au lieu de juste "uuid".
+# on signe "domaine|uuid|fenêtre_de_temps" au lieu de "domaine|uuid".
 # =====================================================================
 
 DUREE_FENETRE_SECONDES = 10
@@ -148,21 +168,18 @@ def fenetre_temps_actuelle() -> int:
     return int(time.time() // DUREE_FENETRE_SECONDES)
 
 
+def _message_rotatif(uuid_carte: str, fenetre: int) -> str:
+    return f"{DOMAINE_ROTATIF}|{uuid_carte}|{fenetre}"
+
+
 def generer_signature_temporelle(uuid_carte: str, fenetre: int) -> tuple[str, int]:
     """
     Comme generer_signature(), mais le message signé inclut la
-    fenêtre de temps : HMAC(uuid:fenetre, cle), pas juste HMAC(uuid, cle).
-    Résultat : la signature change à chaque nouvelle fenêtre, même
-    pour un UUID identique.
+    fenêtre de temps : la signature change à chaque nouvelle fenêtre,
+    même pour un UUID identique.
     """
     version = settings.HMAC_VERSION_ACTIVE
-    cle_secrete = settings.HMAC_CLES[version]
-    message = f"{uuid_carte}:{fenetre}"
-    signature = hmac.new(
-        key=cle_secrete.encode("utf-8"),
-        msg=message.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
+    signature = _hmac_hex(_cle_pour_version(version), _message_rotatif(uuid_carte, fenetre))
     return signature, version
 
 
@@ -172,7 +189,7 @@ def construire_contenu_rotatif(uuid_carte: str) -> str:
     uuid.version.fenetre.signature
     Un quatrième segment (fenetre) par rapport au format statique -
     c'est ce qui permet au scanner de distinguer les deux formats
-    (3 segments = carte physique statique, 4 = carte virtuelle rotative).
+    (3 segments = support statique, 4 = carte virtuelle rotative).
     """
     fenetre = fenetre_temps_actuelle()
     signature, version = generer_signature_temporelle(uuid_carte, fenetre)
@@ -186,27 +203,78 @@ def verifier_signature_temporelle(
     Vérifie une signature rotative, avec une tolérance d'UNE fenêtre
     dans le passé (soit ~20 secondes de validité totale) pour absorber
     le délai entre l'affichage du QR et le moment où le contrôleur
-    termine son scan - sans cette tolérance, un QR pourrait expirer
-    entre l'ouverture de l'appareil photo et la détection du code.
+    termine son scan.
+
+    Le rejeu d'un QR dans sa fenêtre de validité n'est pas bloqué ICI
+    (la vérification reste sans état) : c'est le ticket de scan à usage
+    unique (voir tickets.py) qui empêche d'enregistrer deux présences
+    avec le même scan.
+
+    Pas de format hérité : un QR rotatif ne vit que 20 secondes, il n'y
+    a aucun support ancien à préserver.
     """
     fenetre_actuelle = fenetre_temps_actuelle()
-    fenetres_acceptees = {fenetre_actuelle, fenetre_actuelle - 1}
-
-    if fenetre_recue not in fenetres_acceptees:
+    if fenetre_recue not in (fenetre_actuelle, fenetre_actuelle - 1):
         return False
 
-    cle_secrete = settings.HMAC_CLES.get(version_recue)
-    if cle_secrete is None:
+    cle = _cle_pour_version(version_recue)
+    if cle is None:
         return False
 
-    message = f"{uuid_carte}:{fenetre_recue}"
-    signature_attendue = hmac.new(
-        key=cle_secrete.encode("utf-8"),
-        msg=message.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
+    attendue = _hmac_hex(cle, _message_rotatif(uuid_carte, fenetre_recue))
+    return hmac.compare_digest(attendue, signature_recue)
 
-    return hmac.compare_digest(signature_attendue, signature_recue)
+
+# =====================================================================
+# MOTS DE PASSE TEMPORAIRES
+# =====================================================================
+
+# Sans caractères ambigus (0/O, 1/l/I) : le mot de passe est souvent
+# recopié à la main depuis un email ou un écran.
+_ALPHABET_MDP_TEMPORAIRE = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def generer_mot_de_passe_temporaire(longueur: int = 12) -> str:
+    """
+    Mot de passe temporaire tiré par le CSPRNG du système (secrets),
+    jamais dérivé de données connues (nom, prénom...). 12 caractères
+    sur 55 symboles ≈ 69 bits d'entropie, hors de portée d'une attaque
+    en ligne même sans limitation de débit.
+    """
+    return "AP2A-" + "".join(secrets.choice(_ALPHABET_MDP_TEMPORAIRE) for _ in range(longueur))
+
+
+# =====================================================================
+# TÉLÉVERSEMENT D'IMAGES
+# =====================================================================
+
+TAILLE_MAX_IMAGE_OCTETS = 5 * 1024 * 1024
+FORMATS_IMAGE_AUTORISES = {"JPEG", "PNG", "WEBP"}
+
+
+def erreur_image_televersee(fichier) -> str | None:
+    """
+    Valide une photo téléversée AVANT de l'enregistrer : taille bornée
+    et contenu réellement décodable comme une image d'un format
+    autorisé (on ne se fie ni à l'extension ni au Content-Type envoyés
+    par le client). Retourne un message d'erreur, ou None si l'image
+    est acceptable.
+    """
+    from PIL import Image, UnidentifiedImageError
+
+    if fichier.size > TAILLE_MAX_IMAGE_OCTETS:
+        return "Image trop volumineuse (5 Mo maximum)"
+    try:
+        image = Image.open(fichier)
+        format_image = image.format
+        image.verify()
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError, Image.DecompressionBombError):
+        return "Fichier image invalide"
+    finally:
+        fichier.seek(0)
+    if format_image not in FORMATS_IMAGE_AUTORISES:
+        return "Format d'image non autorisé (JPEG, PNG ou WebP)"
+    return None
 
 
 # =====================================================================

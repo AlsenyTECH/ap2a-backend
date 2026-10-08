@@ -14,7 +14,20 @@ import uuid as uuid_lib
 from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.utils import timezone
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
+
 from adhesion.models import Carte, Compte, Membre, PermissionAdmin
+from adhesion.utils import generer_mot_de_passe_temporaire
+
+
+def _erreur_mot_de_passe(mot_de_passe):
+    """Message d'erreur des validateurs Django (AUTH_PASSWORD_VALIDATORS), ou None."""
+    try:
+        validate_password(mot_de_passe)
+    except ValidationError as e:
+        return " ".join(e.messages)
+    return None
 
 
 class Command(BaseCommand):
@@ -58,7 +71,12 @@ class Command(BaseCommand):
             email = options.get("email") or "admin@ap2a.org"
             nom = options.get("nom") or "Admin"
             prenom = options.get("prenom") or "Super"
-            mot_de_passe = options.get("mot_de_passe") or "AP2A-SuperAdmin-2026"
+            # Jamais de mot de passe par défaut connu : sans argument, on
+            # en tire un au hasard, affiché une seule fois ci-dessous.
+            mot_de_passe = options.get("mot_de_passe")
+            mot_de_passe_genere = not mot_de_passe
+            if mot_de_passe_genere:
+                mot_de_passe = generer_mot_de_passe_temporaire(16)
         else:
             self.stdout.write(self.style.MIGRATE_HEADING(
                 "\n╔══════════════════════════════════════╗"
@@ -81,14 +99,16 @@ class Command(BaseCommand):
 
             import getpass
             mot_de_passe = getpass.getpass("Mot de passe : ")
-            while len(mot_de_passe) < 6:
-                self.stdout.write(self.style.ERROR("Le mot de passe doit faire au moins 6 caractères."))
+            while (erreur := _erreur_mot_de_passe(mot_de_passe)):
+                self.stdout.write(self.style.ERROR(erreur))
                 mot_de_passe = getpass.getpass("Mot de passe : ")
 
+            mot_de_passe_genere = False
             confirmation = getpass.getpass("Confirmer le mot de passe : ")
             while confirmation != mot_de_passe:
                 self.stdout.write(self.style.ERROR("Les mots de passe ne correspondent pas."))
-                confirmation = getpass.getpass("Confirmer le mot de passe : ")
+                mot_de_passe_genere = False
+            confirmation = getpass.getpass("Confirmer le mot de passe : ")
 
         fonction = options.get("fonction") or "PRESIDENT"
         if fonction not in dict(Membre.FONCTION_CHOICES):
@@ -119,6 +139,7 @@ class Command(BaseCommand):
                 est_super_admin=True,
             )
             compte.definir_mot_de_passe(mot_de_passe)
+            compte.doit_changer_mot_de_passe = mot_de_passe_genere
             compte.save()
 
         # Règle décidée ensemble : tout admin est forcément membre - le
@@ -154,6 +175,12 @@ class Command(BaseCommand):
             f"\n   ID       : {compte.id_compte}"
             f"{fiche_membre_msg}"
             f"\n"
+            + (
+                f"\n   Mot de passe généré (affiché une seule fois) : {mot_de_passe}"
+                f"\n   Il devra être changé à la première connexion."
+                if mot_de_passe_genere else ""
+            )
+            + f"\n"
             f"\n   Ce compte a TOUS les droits et ne peut pas être destitué."
             f"\n   Il peut désigner d'autres admins et leur attribuer des permissions."
         ))

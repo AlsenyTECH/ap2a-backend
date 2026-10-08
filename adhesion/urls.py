@@ -12,6 +12,8 @@ from . import views_nouveaux_modules as vnm
 urlpatterns = [
     # --- Public / membre ---
     path("login/", views.vue_connexion, name="connexion"),
+    path("logout/", views.vue_deconnexion, name="deconnexion"),
+    path("telechargement/lien/", views.vue_lien_telechargement, name="lien_telechargement"),
     path("changer-mot-de-passe/", views.vue_changer_mot_de_passe, name="changer_mdp"),
     path("mon-profil/", views.vue_mon_profil_compte, name="mon_profil_compte_get"),
     path("mon-profil/modifier/", views.vue_modifier_profil_compte, name="mon_profil_compte_modifier"),

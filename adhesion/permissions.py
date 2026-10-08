@@ -106,7 +106,7 @@ class PeutControler(BasePermission):
         )
 
 
-def _compte_a_permission(compte, code_permission):
+def compte_a_permission(compte, code_permission):
     """
     Vérifie si un compte admin a une permission spécifique.
     Le super admin a automatiquement TOUTES les permissions.
@@ -138,9 +138,30 @@ def APermission(code_permission):
         def has_permission(self, request, view):
             if not EstAuthentifie().has_permission(request, view):
                 return False
-            return _compte_a_permission(request.user, code_permission)
+            return compte_a_permission(request.user, code_permission)
 
     # Nom lisible dans les erreurs DRF
     PermissionGranulaire.__name__ = f"APermission_{code_permission}"
     PermissionGranulaire.__qualname__ = f"APermission_{code_permission}"
-    return PermissionGranulaire
+    return PermissionGranulaire
+
+
+
+def APermissionUneParmi(*codes_permission):
+    """
+    Comme APermission, mais suffit d'UNE des permissions listées. Pour
+    les données partagées entre modules (ex: la liste des membres sert
+    aussi à cibler les invités d'un événement ou les participants d'une
+    cohorte).
+    """
+
+    class PermissionGranulaireUneParmi(BasePermission):
+        def has_permission(self, request, view):
+            if not EstAuthentifie().has_permission(request, view):
+                return False
+            return any(compte_a_permission(request.user, code) for code in codes_permission)
+
+    nom = "APermissionUneParmi_" + "_".join(codes_permission)
+    PermissionGranulaireUneParmi.__name__ = nom
+    PermissionGranulaireUneParmi.__qualname__ = nom
+    return PermissionGranulaireUneParmi

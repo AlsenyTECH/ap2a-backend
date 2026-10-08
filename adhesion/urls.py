@@ -13,6 +13,7 @@ from . import views_cibles as vc
 
 urlpatterns = [
     # --- Public / membre ---
+    path("sante/", views.vue_sante, name="sante"),
     path("login/", views.vue_connexion, name="connexion"),
     path("logout/", views.vue_deconnexion, name="deconnexion"),
     path("telechargement/lien/", views.vue_lien_telechargement, name="lien_telechargement"),

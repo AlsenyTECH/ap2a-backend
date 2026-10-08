@@ -23,12 +23,12 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.urls import Resolver404, resolve
-from django.db.models import Count, Q, Min, Max
+from django.db.models import Count, Q, Min, Max, Prefetch
 from django.db.models.deletion import ProtectedError
 from django.conf import settings
 from django.http import HttpResponse
 
-from rest_framework.decorators import api_view, permission_classes, parser_classes
+from rest_framework.decorators import api_view, authentication_classes, permission_classes, parser_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
@@ -214,6 +214,18 @@ def vue_connexion(request):
             else []
         ),
     })
+
+
+@api_view(["GET"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def vue_sante(request):
+    """
+    GET /api/sante/ - le serveur répond. Sans authentification ni accès à
+    la base : sert au maintien en éveil (le serveur gratuit s'endort après
+    15 min sans requête) sans consommer les heures de la base Neon.
+    """
+    return Response({"statut": "ok"})
 
 
 @api_view(["POST"])
@@ -1360,14 +1372,18 @@ def vue_liste_evenements(request):
     un événement terminé ne doit plus apparaître ici (décision prise
     ensemble).
     """
-    evenements = Evenement.objects.filter(est_termine=False).order_by("-id_evenement")[:20]
+    evenements = (
+        Evenement.objects.filter(est_termine=False)
+        .annotate(nombre_seances=Count("seances"))
+        .order_by("-id_evenement")[:20]
+    )
     return Response([
         {
             "id_evenement": e.id_evenement,
             "titre": e.titre,
             "lieu": e.lieu,
             "type_evenement": e.type_evenement,
-            "nombre_seances": e.seances.count(),
+            "nombre_seances": e.nombre_seances,
         }
         for e in evenements
     ])
@@ -1499,9 +1515,11 @@ def vue_liste_membres(request):
     fonction : filtre sur la fonction AP2A (champ d'identité principal)
     tri : "nom" / "date_adhesion" / "section" / "fonction" (défaut : -date_adhesion)
     """
+    # Cartes préchargées DÉJÀ triées : une requête pour toutes, au lieu
+    # d'une par membre (m.cartes.order_by(...) ignorerait le préchargement).
     membres = (
         Membre.objects.select_related("compte", "section")
-        .prefetch_related("cartes")
+        .prefetch_related(Prefetch("cartes", queryset=Carte.objects.order_by("-id_carte")))
     )
 
     q = request.query_params.get("q", "").strip()
@@ -1534,7 +1552,8 @@ def vue_liste_membres(request):
 
     resultat = []
     for m in membres:
-        carte = m.cartes.order_by("-id_carte").first()
+        cartes = m.cartes.all()
+        carte = cartes[0] if cartes else None
         statut_carte = carte.statut_carte if carte else None
 
         # Filtre sur le statut de carte : appliqué ici (après avoir
@@ -2125,7 +2144,7 @@ def vue_qr_actuel(request):
 @permission_classes([EstAuthentifie])
 def vue_liste_formations(request):
     """GET /api/formations/ - le catalogue, visible par tout compte connecté."""
-    formations = Formation.objects.order_by("titre")
+    formations = Formation.objects.annotate(nombre_cohortes=Count("cohortes")).order_by("titre")
     return Response([
         {
             "id_formation": f.id_formation,
@@ -2135,7 +2154,7 @@ def vue_liste_formations(request):
             "domaine": f.domaine,
             "duree_heures": f.duree_heures,
             "prerequis": f.prerequis,
-            "nombre_cohortes": f.cohortes.count(),
+            "nombre_cohortes": f.nombre_cohortes,
         }
         for f in formations
     ])

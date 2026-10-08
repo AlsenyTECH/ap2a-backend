@@ -196,3 +196,36 @@ class LienTelechargementTests(TestCase):
         self.assertEqual(
             APIClient().get("/api/admin/rapports/export/", {"telechargement": valeur}).status_code, 403
         )
+
+
+class SanteEtPerformanceTests(TestCase):
+
+    def test_sante_sans_authentification_ni_base(self):
+        with self.assertNumQueries(0):
+            reponse = APIClient().get("/api/sante/")
+        self.assertEqual(reponse.status_code, 200)
+        self.assertEqual(reponse.data, {"statut": "ok"})
+
+    def test_listes_sans_requete_par_element(self):
+        """Une base distante rend chaque requête coûteuse : le nombre ne doit pas grandir avec les données."""
+        from .outils import creer_carte, creer_evenement
+
+        admin = creer_compte(est_super_admin=True)
+        client = client_pour(admin)
+        for _ in range(15):
+            creer_carte(creer_membre(), "QR")
+        for _ in range(5):
+            creer_evenement(admin)
+        for url, maximum in (
+            ("/api/admin/membres/", 4),
+            ("/api/evenements/", 4),
+            ("/api/formations/", 4),
+            ("/api/actions-sociales/", 4),
+            ("/api/dashboard/stats/", 13),
+        ):
+            with self.subTest(url=url):
+                from django.db import connection
+                from django.test.utils import CaptureQueriesContext
+                with CaptureQueriesContext(connection) as requetes:
+                    self.assertEqual(client.get(url).status_code, 200)
+                self.assertLessEqual(len(requetes), maximum)

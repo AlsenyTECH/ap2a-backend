@@ -294,7 +294,7 @@ def vue_liste_actions_sociales(request):
     Liste de toutes les actions sociales avec nombre de bénéficiaires.
     Filtrable par ?type=COMMERCE&statut=EN_COURS
     """
-    actions = ActionSociale.objects.annotate(
+    actions = ActionSociale.objects.select_related("compte_organisateur").annotate(
         nb_beneficiaires=Count("participations"),
     )
 
@@ -1182,9 +1182,19 @@ def vue_dashboard_stats(request):
     maintenant = timezone.now()
     aujourdhui = maintenant.date()
 
+    # Chaque bloc regroupe ses comptages en UNE requête (aggregate +
+    # filter) : la base de production est distante, chaque aller-retour
+    # coûte des dizaines de millisecondes.
+    il_y_a_7_jours = maintenant - timezone.timedelta(days=7)
+
     # Membres
-    nb_membres_actifs = Membre.objects.filter(statut_adhesion="ACTIF").count()
-    nb_membres_total = Membre.objects.count()
+    stats_membres = Membre.objects.aggregate(
+        total=Count("id_membre"),
+        actifs=Count("id_membre", filter=Q(statut_adhesion="ACTIF")),
+        nouveaux_7j=Count("id_membre", filter=Q(date_adhesion__gte=il_y_a_7_jours.date())),
+    )
+    nb_membres_actifs = stats_membres["actifs"]
+    nb_membres_total = stats_membres["total"]
     par_fonction = (
         Membre.objects.values("fonction_association")
         .annotate(nombre=Count("id_membre"))
@@ -1208,10 +1218,16 @@ def vue_dashboard_stats(request):
     ).distinct().count()
 
     # Formations
-    formations_en_cours = Cohorte.objects.filter(statut="EN_COURS").count()
-    nb_participants_actifs = InscriptionCohorte.objects.filter(
-        cohorte__statut="EN_COURS", statut="INSCRIT"
-    ).count()
+    stats_cohortes = Cohorte.objects.aggregate(
+        en_cours=Count("id_cohorte", filter=Q(statut="EN_COURS")),
+        terminees=Count("id_cohorte", filter=Q(statut="TERMINEE")),
+    )
+    formations_en_cours = stats_cohortes["en_cours"]
+    stats_inscriptions = InscriptionCohorte.objects.aggregate(
+        actifs=Count("pk", filter=Q(cohorte__statut="EN_COURS", statut="INSCRIT")),
+        kits=Count("pk", filter=Q(kit_distribue=True)),
+    )
+    nb_participants_actifs = stats_inscriptions["actifs"]
 
     # Actions sociales
     actions_en_cours = ActionSociale.objects.filter(statut="EN_COURS").count()
@@ -1219,13 +1235,14 @@ def vue_dashboard_stats(request):
 
     # Registre d'impact : agrégats cumulatifs (pas juste le "live"
     # ci-dessus), toutes périodes confondues.
-    formations_terminees_total = Cohorte.objects.filter(statut="TERMINEE").count()
+    formations_terminees_total = stats_cohortes["terminees"]
     kits_distribues_total = (
-        DistributionKit.objects.filter(distribue=True).count()
-        + InscriptionCohorte.objects.filter(kit_distribue=True).count()
+        DistributionKit.objects.filter(distribue=True).count() + stats_inscriptions["kits"]
     )
-    suivis_total = SuiviPostFormation.objects.count()
-    suivis_succes = SuiviPostFormation.objects.filter(statut_global="SUCCES").count()
+    stats_suivis = SuiviPostFormation.objects.aggregate(
+        total=Count("pk"), succes=Count("pk", filter=Q(statut_global="SUCCES")),
+    )
+    suivis_total, suivis_succes = stats_suivis["total"], stats_suivis["succes"]
     taux_reussite_suivi = round(100 * suivis_succes / suivis_total, 1) if suivis_total else None
 
     # Notifications non lues (pour cet admin)
@@ -1233,11 +1250,7 @@ def vue_dashboard_stats(request):
         compte_destinataire=request.user, lu=False
     ).count()
 
-    # Activité récente (7 derniers jours)
-    il_y_a_7_jours = maintenant - timezone.timedelta(days=7)
-    nouveaux_membres_7j = Membre.objects.filter(
-        date_adhesion__gte=il_y_a_7_jours.date()
-    ).count()
+    nouveaux_membres_7j = stats_membres["nouveaux_7j"]
 
     return Response({
         "date_mise_a_jour": maintenant.isoformat(),

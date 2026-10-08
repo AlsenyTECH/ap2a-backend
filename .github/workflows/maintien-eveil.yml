@@ -1,0 +1,24 @@
+# Le serveur gratuit de Render s'endort après 15 minutes sans requête, et
+# met ensuite près d'une minute à se réveiller : l'application paraît
+# « hyper lente » au premier clic. Ce workflow l'interroge toutes les
+# 10 minutes pendant la journée (heure de Dakar = UTC), sur un point de
+# santé qui ne touche pas à la base de données.
+#
+# Gratuit pour un dépôt public. URL modifiable via la variable de dépôt
+# URL_API (Settings > Secrets and variables > Actions > Variables).
+name: Maintien en éveil de l'API
+
+on:
+  schedule:
+    - cron: "*/10 6-22 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Interroger /api/sante/
+        env:
+          URL_API: ${{ vars.URL_API || 'https://ap2a-backend.onrender.com' }}
+        run: curl --fail --silent --show-error --retry 3 --retry-delay 20 --max-time 90 "$URL_API/api/sante/"

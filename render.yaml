@@ -16,7 +16,9 @@ services:
     # amorcer_super_admin ne fait rien tant que AP2A_ADMIN_EMAIL /
     # AP2A_ADMIN_MOT_DE_PASSE ne sont pas définies (récupération d'accès).
     buildCommand: "pip install -r requirements.txt && python manage.py collectstatic --no-input && python manage.py migrate && python manage.py amorcer_super_admin"
+    # Processus et fils : voir gunicorn.conf.py (chargé automatiquement).
     startCommand: "gunicorn core.wsgi:application"
+    healthCheckPath: /api/sante/
     envVars:
       - key: PYTHON_VERSION
         value: "3.13.6"

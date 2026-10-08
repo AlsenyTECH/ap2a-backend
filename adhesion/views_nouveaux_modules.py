@@ -356,6 +356,8 @@ def vue_detail_action_sociale(request, id_action):
             .select_related("beneficiaire")
             .prefetch_related("detail_medical", "detail_commerce", "detail_atelier")
         )
+        # Données médicales : jamais renvoyées sans la permission dédiée.
+        voit_medical = compte_a_permission(request.user, "DONNEES_MEDICALES")
         return Response({
             "id_action": action.id_action,
             "titre": action.titre,
@@ -392,7 +394,8 @@ def vue_detail_action_sociale(request, id_action):
                         "traitement_effectue": getattr(getattr(p, "detail_medical", None), "traitement_effectue", False),
                         "date_traitement": str(p.detail_medical.date_traitement) if hasattr(p, "detail_medical") and p.detail_medical.date_traitement else None,
                         "notes_suivi": getattr(getattr(p, "detail_medical", None), "notes_suivi", "") or "",
-                    } if hasattr(p, "detail_medical") else None,
+                    } if voit_medical and hasattr(p, "detail_medical") else None,
+                    "detail_medical_masque": not voit_medical and hasattr(p, "detail_medical"),
                 }
                 for p in participations
             ],
@@ -442,6 +445,17 @@ def vue_ajouter_beneficiaire(request, id_action):
         return Response(
             {"erreur": "nom et prenom sont requis"},
             status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Vérifié AVANT toute création : un refus ne doit rien laisser en base.
+    if (
+        action.type_action == "MEDICAL"
+        and request.data.get("type_soin")
+        and not compte_a_permission(request.user, "DONNEES_MEDICALES")
+    ):
+        return Response(
+            {"erreur": "La saisie de données médicales demande la permission « Données médicales »"},
+            status=status.HTTP_403_FORBIDDEN,
         )
 
     # Dédoublonnage par téléphone
@@ -1880,7 +1894,7 @@ def vue_basculer_don_recu(request, id_action, id_participation):
 
 
 @api_view(["POST", "PATCH"])
-@permission_classes([APermission("GERER_ACTIONS_SOCIALES")])
+@permission_classes([APermission("GERER_ACTIONS_SOCIALES"), APermission("DONNEES_MEDICALES")])
 def vue_mettre_a_jour_suivi_medical(request, id_action, id_participation):
     """
     POST/PATCH /api/admin/action-sociale/<id_action>/participation/<id_participation>/suivi-medical/

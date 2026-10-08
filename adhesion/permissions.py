@@ -165,3 +165,19 @@ def APermissionUneParmi(*codes_permission):
     PermissionGranulaireUneParmi.__name__ = nom
     PermissionGranulaireUneParmi.__qualname__ = nom
     return PermissionGranulaireUneParmi
+
+
+def PermissionSelonMethode(lecture, ecriture):
+    """
+    Combine deux permissions selon la méthode HTTP : `lecture` pour
+    GET/HEAD/OPTIONS, `ecriture` pour tout le reste. Pour une même
+    route qui sert à la fois de liste (large) et de modification
+    (restreinte).
+    """
+
+    class PermissionParMethode(BasePermission):
+        def has_permission(self, request, view):
+            classe = lecture if request.method in ("GET", "HEAD", "OPTIONS") else ecriture
+            return classe().has_permission(request, view)
+
+    return PermissionParMethode

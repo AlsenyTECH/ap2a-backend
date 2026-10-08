@@ -8,6 +8,7 @@ sous le préfixe /api/.
 from django.urls import path
 from . import views
 from . import views_nouveaux_modules as vnm
+from . import views_referentiels as vr
 
 urlpatterns = [
     # --- Public / membre ---
@@ -333,4 +334,20 @@ urlpatterns = [
         name="basculer_distribution_kit",
     ),
     path("admin/kit/<int:id_kit>/distribution/", vnm.vue_distribution_kit, name="distribution_kit"),
+
+    # --- Référentiels du suivi des actions (zones, partenaires, types d'action) ---
+    path("referentiels/zones/", vr.vue_liste_zones, name="liste_zones"),
+    path("admin/zones/", vr.vue_creer_zone, name="creer_zone"),
+    path("admin/zones/<int:id_zone>/", vr.vue_gerer_zone, name="gerer_zone"),
+    path("admin/partenaires/", vr.vue_partenaires, name="partenaires"),
+    path("admin/partenaires/<int:id_partenaire>/", vr.vue_gerer_partenaire, name="gerer_partenaire"),
+    path("referentiels/types-action/", vr.vue_liste_types_action, name="liste_types_action"),
+    path("admin/types-action/", vr.vue_creer_type_action, name="creer_type_action"),
+    path("admin/types-action/<int:id_type_action>/", vr.vue_gerer_type_action, name="gerer_type_action"),
+    path(
+        "admin/types-action/<int:id_type_action>/indicateurs/",
+        vr.vue_creer_indicateur,
+        name="creer_indicateur",
+    ),
+    path("admin/indicateurs/<int:id_indicateur>/", vr.vue_gerer_indicateur, name="gerer_indicateur"),
 ]

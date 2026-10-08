@@ -127,7 +127,7 @@ def _doublons_json(doublons):
 def _avec_compteurs(cibles):
     return cibles.select_related("zone__parent__parent__parent", "membre").annotate(
         nombre_appartenances=Count("appartenances", distinct=True) + Count("membres_collectif", distinct=True),
-        nombre_actions=Count("beneficiaire_origine__participations", distinct=True),
+        nombre_actions=Count("beneficiaire_origine__participations", distinct=True) + Count("actions", distinct=True),
     )
 
 
@@ -225,7 +225,17 @@ def vue_verifier_doublons(request):
 
 def _historique(cible):
     """Actions dont la cible a bénéficié, de la plus récente à la plus ancienne."""
-    evenements = []
+    evenements = [
+        {
+            "nature": "ACTION",
+            "id": ac.action_id,
+            "titre": ac.action.titre,
+            "type": ac.action.type_action.libelle,
+            "date": ac.date_intervention or ac.action.date_debut,
+            "statut": f"{ac.action.get_statut_display()} · {ac.get_statut_display()}",
+        }
+        for ac in cible.actions.select_related("action__type_action")
+    ]
     if cible.beneficiaire_origine_id:
         for p in cible.beneficiaire_origine.participations.select_related("action"):
             evenements.append({
@@ -276,6 +286,19 @@ def _fiche(cible):
         **CibleSerializer(cible).data,
         "appartenances": _appartenances(cible),
         "historique": _historique(cible),
+        "besoins": [
+            {
+                "id_besoin": b.id_besoin,
+                "description": b.description,
+                "type_action": b.type_action_id,
+                "type_action_libelle": b.type_action.libelle if b.type_action else None,
+                "priorite": b.priorite,
+                "statut": b.statut,
+                "date_identification": b.date_identification,
+                "notes": b.notes,
+            }
+            for b in cible.besoins.select_related("type_action")
+        ],
     }
 
 

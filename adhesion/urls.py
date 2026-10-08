@@ -10,6 +10,7 @@ from . import views
 from . import views_nouveaux_modules as vnm
 from . import views_referentiels as vr
 from . import views_cibles as vc
+from . import views_actions as va
 
 urlpatterns = [
     # --- Public / membre ---
@@ -362,4 +363,25 @@ urlpatterns = [
     path("admin/cibles/<int:id_cible>/appartenances/", vc.vue_ajouter_appartenance, name="ajouter_appartenance"),
     path("admin/cibles/<int:id_cible>/fusionner/", vc.vue_fusionner, name="fusionner_cibles"),
     path("admin/appartenances/<int:id_appartenance>/", vc.vue_supprimer_appartenance, name="supprimer_appartenance"),
+
+    # --- Actions (avant / pendant / après), besoins des cibles, calendrier ---
+    path("admin/actions/", va.vue_actions, name="actions"),
+    path("admin/actions/<int:id_action>/", va.vue_action, name="action"),
+    path("admin/actions/<int:id_action>/statut/", va.vue_changer_statut_action, name="statut_action"),
+    path("admin/actions/<int:id_action>/cibles/", va.vue_ajouter_cibles_action, name="ajouter_cibles_action"),
+    path("admin/actions/<int:id_action>/cibles/statut/", va.vue_statut_cibles_lot, name="statut_cibles_lot"),
+    path("admin/actions/<int:id_action>/valeurs/", va.vue_enregistrer_valeurs, name="valeurs_action"),
+    path("admin/actions/<int:id_action>/partenaires/", va.vue_ajouter_partenaire_action, name="partenaires_action"),
+    path("admin/actions/<int:id_action>/equipe/", va.vue_affecter_membres, name="equipe_action"),
+    path("admin/actions/<int:id_action>/taches/", va.vue_ajouter_tache, name="taches_action"),
+    path("admin/action-cibles/<int:id_action_cible>/", va.vue_action_cible, name="action_cible"),
+    path("admin/action-partenaires/<int:id_action_partenaire>/", va.vue_retirer_partenaire_action, name="action_partenaire"),
+    path("admin/equipe/<int:id_membre_equipe>/", va.vue_membre_equipe, name="membre_equipe"),
+    path("admin/taches/<int:id_tache>/", va.vue_tache, name="tache"),
+    path("admin/besoins/", va.vue_besoins, name="besoins"),
+    path("admin/besoins/<int:id_besoin>/", va.vue_besoin, name="besoin"),
+    path("admin/cibles/<int:id_cible>/besoins/", va.vue_ajouter_besoin, name="ajouter_besoin"),
+    path("admin/calendrier/", va.vue_calendrier, name="calendrier"),
+    path("membre/actions/", va.vue_mes_actions, name="mes_actions"),
+    path("membre/actions/<int:id_action>/volontaire/", va.vue_volontariat, name="volontariat"),
 ]
